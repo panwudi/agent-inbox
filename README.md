@@ -10,8 +10,20 @@ during its current turn, or starts a turn when the thread is idle.
 `hub` routes cross-machine messages by stable logical name and authenticated
 sender token, through SSH tunnels. See [hub setup](docs/HUB-USAGE.md).
 `relay` shares one tunnel per computer and routes `<host>.<agent>` names.
+Auto-join defaults distinguish same-directory pairs as `<host>.<basename>-claude`
+and `<host>.<basename>-codex`; same-type duplicates receive `-2`, `-3`, etc.
+Explicit inbox `--name` overrides keep their chosen component.
 `who` discovers authenticated agent descriptions and availability. Start with
 [host relay setup and migration](docs/HOST-RELAY.md).
+
+For Claude sessions, [automatic joining](docs/CLAUDE-AUTO-JOIN.md) uses one
+user-scoped `agent-inbox-join` MCP entry and an all-directory channel wrapper.
+Each session gets an ephemeral inbox, private credentials and a directory name;
+`inbox_profile` reads or updates its own name/description. No manual session row.
+
+For Codex, [the per-user watcher](docs/CODEX-AUTO-JOIN.md) registers one inbox per
+exact loaded thread ID, with names from thread cwd. Online does not imply a
+human is watching; a message to an idle Codex may start autonomous work.
 
 `upgrade-codex` holds Codex inbox deliveries while waiting for an idle upgrade
 window, verifies the new daemon, then releases FIFO queues. See
@@ -268,7 +280,9 @@ only your hub address, your token, and the destination's logical name. An
 offline destination returns 503; inspect sender, hub, and receiver journals
 before resending. After a reconnect, "peer offline" 503 can also mean sshd is
 still holding a stale `-R` forward. It clears once the old SSH session ends and
-the supervisor re-establishes the tunnel. See the
+the supervisor attaches the replacement reverse forward over its existing
+authenticated connection. Its local hub forward remains available during
+reverse-port recovery. See the
 [public-link timing and stale-port guidance](deploy/README.md#route-selection-retries-and-stale-reverse-ports).
 Claude still needs the channel flag or it drops notifications.
 
@@ -286,6 +300,9 @@ kernel file lock limiting concurrent dials to one per host/relay. Established
 tunnels can coexist. Retry backoff starts at 15 seconds, grows to 300 seconds,
 uses +/-20% jitter with a 300-second hard ceiling, and resets after five
 authenticated minutes. Update older tunnel environment files before restarting.
+If an old sshd still holds the reverse port, only that forward is retried every
+2.4-3.6 seconds over the existing master; it keeps the local hub forward alive
+and makes no extra SSH login. The log confirms when both forwards are ready.
 
 The relay owner reviews `MaxStartups` and `LoginGraceTime` for administrative
 access and measured handshake times. See

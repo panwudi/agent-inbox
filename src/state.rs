@@ -21,6 +21,17 @@ pub fn id() -> Result<String> {
     ))
 }
 
+pub fn is_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 pub fn open_private(path: &Path, create: bool) -> Result<File> {
     let mut options = OpenOptions::new();
     options

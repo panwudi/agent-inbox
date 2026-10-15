@@ -10,8 +10,17 @@
 `hub` 经由 SSH 隧道, 按稳定的逻辑名和经过鉴权的发送方 token 路由跨机器消息.
 参见 [hub 配置](docs/HUB-USAGE.md).
 `relay` 让每台电脑共用一条隧道, 并路由 `<host>.<agent>` 形式的名字.
+自动加入的默认名字用 `<host>.<basename>-claude` 和 `<host>.<basename>-codex` 区分同一目录下的一对会话;
+同类型的重复项依次加 `-2`, `-3` 等后缀. 显式的 inbox `--name` 覆盖会保留其指定的那一段.
 `who` 发现经过鉴权的 agent 描述及其可用状态. 请从
 [host relay 配置与迁移](docs/HOST-RELAY.md) 开始.
+
+Claude 会话的 [自动加入](docs/CLAUDE-AUTO-JOIN.md) 使用一个用户级的 `agent-inbox-join` MCP 条目,
+以及一个对所有目录生效的 channel 包装脚本. 每个会话获得一个临时 inbox, 私有凭据和一个目录名;
+`inbox_profile` 读取或更新它自己的名字/描述. 无需手工添加会话条目.
+
+对于 Codex, [按用户运行的 watcher](docs/CODEX-AUTO-JOIN.md) 为每个已加载的精确 thread ID 注册一个 inbox,
+名字取自 thread 的 cwd. 在线并不表示有人在看; 发给空闲 Codex 的消息可能会启动自主工作.
 
 `upgrade-codex` 在等待空闲升级窗口期间暂存 Codex inbox 的投递, 校验新的 daemon,
 然后放行 FIFO 队列. 关于禁用独立更新程序, 注册每个 inbox, 报告, 恢复以及
@@ -261,7 +270,8 @@ relay 所有者注册两个稳定的逻辑名, 例如 `my-pair-claude`
 自己的 hub 地址, 自己的 token 以及目的地的逻辑名. 目的地离线时
 返回 503; 重发之前请检查发送方, hub 和接收方的 journal.
 重连之后, "peer offline" 503 也可能表示 sshd 仍持有一个过期的 `-R` 转发.
-旧的 SSH 会话结束, 且监管程序重新建立隧道后, 它就会消失. 参见
+旧的 SSH 会话结束, 且监管程序在已鉴权的现有连接上挂上新的反向转发后, 它就会消失.
+在反向端口恢复期间, 本地 hub 转发保持可用. 参见
 [公网链路时序与过期端口指南](deploy/README.md#route-selection-retries-and-stale-reverse-ports).
 Claude 仍然需要 channel 参数, 否则会丢弃 notification.
 
@@ -278,6 +288,8 @@ hub 的 peer 转发期限是 10 秒, 既容许较慢的隧道回复,
 把每个 host/relay 的并发拨号限制为一个. 已建立的隧道可以共存.
 重试退避从 15 秒开始, 增长到 300 秒, 使用 +/-20% 抖动并以 300 秒为硬上限,
 在鉴权成功持续五分钟后重置. 重启之前请更新旧的隧道环境文件.
+如果旧的 sshd 仍占着反向端口, 只有这个转发会在现有 master 上每 2.4-3.6 秒重试一次;
+本地 hub 转发保持存活, 也不会产生额外的 SSH 登录. 两个转发都就绪时日志会给出确认.
 
 relay 所有者需要根据管理访问和实测的握手时间审视 `MaxStartups` 和 `LoginGraceTime`.
 参见 [部署限制与升级说明](deploy/README.md#protecting-the-relays-sshd).

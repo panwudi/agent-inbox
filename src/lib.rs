@@ -1,13 +1,23 @@
 pub mod claude;
+#[cfg(unix)]
+pub mod claude_join;
 pub mod codex;
+#[cfg(unix)]
+pub mod codex_auto;
 pub mod codex_inbox;
+#[cfg(unix)]
+pub mod codex_presence;
 pub mod codex_queue;
 pub mod codex_registry;
+#[cfg(unix)]
+pub mod codex_watch;
 pub mod command;
 pub mod directory;
 pub mod http;
 pub mod hub;
 pub mod journal;
+#[cfg(unix)]
+pub mod local_control;
 pub mod proxy;
 #[cfg(unix)]
 pub mod relay;

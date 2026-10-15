@@ -12,6 +12,25 @@ use crate::{
     validate_message,
 };
 
+pub struct Config {
+    pub thread: String,
+    pub listener: TcpListener,
+    pub token: Token,
+    pub token_file: PathBuf,
+    pub log: PathBuf,
+    pub sender: String,
+    pub codex: PathBuf,
+    pub socket: Option<PathBuf>,
+    pub timeout: Duration,
+    pub queue_file: Option<PathBuf>,
+    pub notify: Option<PathBuf>,
+    pub notify_args: Vec<String>,
+    pub registry_dir: Option<PathBuf>,
+    pub running: Arc<AtomicBool>,
+    pub metadata: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
+    pub routing_context: Option<String>,
+}
+
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut thread = None;
     let mut listen = None;
@@ -81,6 +100,45 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         None => journal::default_path()?,
     };
     let listener = TcpListener::bind(listen)?;
+    serve(Config {
+        thread,
+        listener,
+        token,
+        token_file,
+        log,
+        sender,
+        codex,
+        socket,
+        timeout: Duration::from_secs(timeout),
+        queue_file,
+        notify,
+        notify_args,
+        registry_dir,
+        running: Arc::new(AtomicBool::new(true)),
+        metadata: None,
+        routing_context: None,
+    })
+}
+
+pub fn serve(config: Config) -> Result<()> {
+    let Config {
+        thread,
+        listener,
+        token,
+        token_file,
+        log,
+        sender,
+        codex,
+        socket,
+        timeout,
+        queue_file,
+        notify,
+        notify_args,
+        registry_dir,
+        running,
+        metadata,
+        routing_context,
+    } = config;
     let address = listener.local_addr()?;
     let queue_file = queue_file.unwrap_or_else(|| {
         log.with_file_name(format!(
@@ -112,14 +170,17 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     queue.start(Backend {
         codex,
         socket,
-        timeout: Duration::from_secs(timeout),
+        timeout,
         thread: thread.clone(),
         log: log.clone(),
         address: address.to_string(),
         token_file,
         notify,
         notify_args,
+        routing_context,
+        running: Arc::clone(&running),
     });
+    let shutdown = Arc::clone(&queue);
     let admission = Mutex::new(());
     let handler = Arc::new(
         move |path: &str, text: &str, from: Option<&str>, _: http::Origin| {
@@ -127,6 +188,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
                 return match queue.status() {
                     Ok(mut status) => {
                         status["instance"] = serde_json::json!(instance);
+                        if let Some(metadata) = &metadata {
+                            status["autoJoin"] = metadata();
+                        }
                         http::Response::json(200, status)
                     }
                     Err(_) => http::Response::new(500, "queue status unavailable"),
@@ -209,10 +273,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
             .authorizes(header)
             .then_some(http::SenderIdentity::Header)
     });
-    http::serve_authenticated(
-        listener,
-        Arc::new(AtomicBool::new(true)),
-        authenticate,
-        handler,
-    )
+    let result = http::serve_authenticated(listener, Arc::clone(&running), authenticate, handler);
+    running.store(false, std::sync::atomic::Ordering::Release);
+    shutdown.finish_notifier();
+    result
 }

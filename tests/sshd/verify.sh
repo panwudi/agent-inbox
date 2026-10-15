@@ -85,6 +85,57 @@ inbox_expect_rejected() {
         printf '%s\n' 'An operation was allowed or hung instead of being rejected.' >&2; exit 1;
     }
 }
+# A stale -R must not kill the replacement master or its useful -L. Restricted
+# nologin/MaxSessions=0 permits these control requests without opening a shell.
+cat > "$inbox_test_dir/supervisor.env" <<EOF
+INBOX_SSH_USER='agent-tunnel'
+INBOX_BIN='/artifacts/agent-inbox'
+INBOX_SSH_CONFIG='/dev/null'
+INBOX_SSH_KEY='$inbox_test_dir/claude'
+INBOX_KNOWN_HOSTS='$inbox_test_dir/known_hosts'
+INBOX_HOST_KEY_ALIAS='restricted-local'
+INBOX_DIAL_LOCK_FILE='$inbox_test_dir/dial.lock'
+INBOX_INTR_HOST='127.0.0.1'
+INBOX_INTR_PORT=22221
+INBOX_PUBLIC_HOST='127.0.0.1'
+INBOX_PUBLIC_PORT=22221
+INBOX_LOCAL_INBOX_PORT=8815
+INBOX_REVERSE_PORT=8817
+INBOX_LOCAL_SEND_PORT=8825
+INBOX_HUB_PORT=8811
+EOF
+sh /artifacts/deploy/agent-inbox-tunnels.sh --config "$inbox_test_dir/supervisor.env" \
+    > "$inbox_test_dir/replacement.log" 2>&1 &
+inbox_replacement_pid=$!
+inbox_test_pids="$inbox_test_pids $inbox_replacement_pid"
+inbox_ready=0
+for inbox_try in 1 2 3 4 5 6 7 8 9 10; do
+    if curl --silent --fail --max-time 1 http://127.0.0.1:8825/ >/dev/null; then inbox_ready=1; break; fi
+    sleep 0.2
+done
+[ "$inbox_ready" = '1' ] || { cat "$inbox_test_dir/replacement.log" >&2; exit 1; }
+inbox_ready=0
+for inbox_try in $(seq 1 40); do
+    if [ "$(grep -c 'reverse forward unavailable' "$inbox_test_dir/replacement.log")" -ge 2 ]; then inbox_ready=1; break; fi
+    sleep 0.2
+done
+[ "$inbox_ready" = '1' ] || { cat "$inbox_test_dir/replacement.log" >&2; exit 1; }
+kill -0 "$inbox_replacement_pid"
+curl --silent --fail --max-time 2 http://127.0.0.1:8825/ >/dev/null
+ssh -F /dev/null -S "$inbox_test_dir/claude-control" -O cancel \
+    -R 127.0.0.1:8817:127.0.0.1:8815 127.0.0.1
+inbox_ready=0
+for inbox_try in $(seq 1 40); do
+    if grep -q 'both loopback forwards ready on existing SSH' "$inbox_test_dir/replacement.log"; then inbox_ready=1; break; fi
+    sleep 0.2
+done
+[ "$inbox_ready" = '1' ] || { cat "$inbox_test_dir/replacement.log" >&2; exit 1; }
+[ "$(grep -c 'connecting local hub forward' "$inbox_test_dir/replacement.log")" -eq 1 ]
+! grep -q 'SSH ended' "$inbox_test_dir/replacement.log"
+kill -0 "$inbox_replacement_pid"
+curl --silent --fail --max-time 2 http://127.0.0.1:8817/ >/dev/null
+curl --silent --fail --max-time 2 http://127.0.0.1:8825/ >/dev/null
+printf '%s\n' 'Lingering reverse port: replacement master/-L survived repeated failures; -R attached on the same connection after release.'
 # The other session's reverse port, a non-hub destination, shell and SFTP are denied.
 inbox_expect_rejected "$inbox_test_dir/client" "$inbox_test_dir/claude" -N -T -n \
     -o ExitOnForwardFailure=yes -R 127.0.0.1:8819:127.0.0.1:8815 127.0.0.1

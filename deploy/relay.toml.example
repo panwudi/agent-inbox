@@ -7,6 +7,11 @@ state_dir = '/absolute/path/to/state'
 tunnel_script = '/absolute/path/to/deploy/agent-inbox-tunnels.sh'
 tunnel_env = 'host-tunnel.env'
 directory_report_secs = 15
+# Claude auto-join uses a same-user private Unix control socket. These settings
+# are optional; if overriding the path, match --control-socket in the MCP entry.
+# control_socket = '/absolute/path/to/private-control/relay.sock'
+# session_ttl_secs = 45
+# Static entries below remain optional when sessions join automatically.
 
 [[agents]]
 name = 'main-review'

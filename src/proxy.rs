@@ -17,6 +17,7 @@ pub struct ProxyStream {
 
 impl ProxyStream {
     pub fn spawn(codex: &Path, socket: &Path, timeout: Duration) -> Result<Self> {
+        check_socket_owner(socket)?;
         let mut child = Command::new(codex)
             .args(["app-server", "proxy", "--sock"])
             .arg(socket)
@@ -109,6 +110,18 @@ impl Drop for ProxyStream {
 }
 
 pub const CODEX_VERSION: &str = "0.162.1";
+
+pub fn check_socket_owner(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::metadata(path).map_err(|_| "Codex control socket unavailable")?;
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("Codex control socket must belong to this OS user".into());
+        }
+    }
+    Ok(())
+}
 
 /// Warn on untested versions; validate the actual protocol during delivery.
 pub fn checked_socket(codex: &Path, custom_socket: Option<&Path>) -> Result<PathBuf> {

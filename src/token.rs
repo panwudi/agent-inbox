@@ -7,9 +7,27 @@ use subtle::ConstantTimeEq;
 use crate::Result;
 
 /// Intentionally has no Debug implementation; credentials never enter output.
+#[derive(Clone)]
 pub struct Token(Vec<u8>);
 
 impl Token {
+    pub(crate) fn from_text(text: &str) -> Result<Self> {
+        if text.is_empty() || text.len() > 4096 || !text.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("token must be bounded printable ASCII without whitespace".into());
+        }
+        Ok(Self(text.as_bytes().to_vec()))
+    }
+
+    pub(crate) fn fresh() -> Result<Self> {
+        let mut random = [0; 32];
+        File::open("/dev/urandom")?.read_exact(&mut random)?;
+        Self::from_text(
+            &random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        )
+    }
     pub fn read(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(|_| "cannot open token file")?;
         let metadata = file.metadata().map_err(|_| "cannot inspect token file")?;

@@ -7,6 +7,21 @@ The current topology uses [one host relay/tunnel](../docs/HOST-RELAY.md), with
 host-only central registration and a prefix-scoped agent directory. Per-session
 tunnel instructions below remain available for migration.
 
+For [Claude auto-join](../docs/CLAUDE-AUTO-JOIN.md), ship the user-scope
+[MCP entry](claude-user-mcp.json.example) and the all-directory
+[shell wrapper](claude-with-inbox.bash) together. Both use the exact MCP name
+`agent-inbox-join`; the channel argument is `server:agent-inbox-join`.
+The relay must run as the same UID as these sessions; Linux can use the
+[user relay unit](agent-inbox-relay.user.service). Dedicated-account system
+services need a writable private control path and matching session ownership.
+
+Codex uses the additive [watcher setup](../docs/CODEX-AUTO-JOIN.md),
+[config example](codex-watch.toml.example), [launchd template](io.agent-inbox.codex-watch.plist.example)
+or [systemd user unit](agent-inbox-codex-watch.service). It reuses the same local
+relay without a per-thread MCP entry or manual registration. Online denotes
+loaded-thread/inbox state, with the daemon's disconnect grace; idle delivery
+can start work without an attached human.
+
 ## Files
 
 | File | Purpose |
@@ -139,11 +154,15 @@ The supervisor refreshes these facts after acquiring the shared dial lock on
 every retry. A failed selected endpoint waits for the next gentle retry; it
 does not immediately try another endpoint.
 
-The Rust supervisor starts one real SSH connection per attempt with both
-forwards. It overrides ProxyCommand/ProxyJump and uses a private master socket
-for that connection. Once OpenSSH creates the socket after authentication,
-the supervisor releases the dial lock; established tunnels can coexist. No
-second SSH connection or `ssh -O` command is used to detect readiness, and the
+The Rust supervisor starts one real SSH connection per attempt, initially with
+only the local hub forward (`-L`). It overrides ProxyCommand/ProxyJump and uses
+a private master socket for that connection. Once OpenSSH creates the socket after authentication,
+the supervisor releases the dial lock; established tunnels can coexist. It then
+adds the reverse forward with `ssh -O forward -R ...` through that private
+socket. This control operation neither authenticates a second SSH connection
+nor executes a remote shell, and fails if the master is missing. See the
+[OpenSSH control commands](https://man.openbsd.org/ssh#O).
+No second SSH connection is used to detect readiness, and the
 temporary master is never reused by a later attempt. Both supervisor and guard
 hold the same locked file description before authentication. If the supervisor
 crashes, the guard stops its SSH; if the guard crashes, the supervisor stops
@@ -165,7 +184,25 @@ Unsafe older settings (initial below 15, maximum above 300, stable reset below
 `INBOX_BIN`, `INBOX_DIAL_LOCK_FILE` and the local prefix/gateway rule. Remove
 the obsolete probe settings `INBOX_CONNECT_TIMEOUT` and `INBOX_PROBE_TIMEOUT`.
 
-`ExitOnForwardFailure=yes` rejects failed forward setup. `ServerAliveInterval=15`
+`ExitOnForwardFailure=yes` rejects a failed local forward at initial setup.
+If the reverse port is still held by an old sshd session, only the `-O forward`
+request fails: the live SSH master and usable `-L` stay up. The supervisor
+retries that request every 3 seconds with +/-20% jitter (2.4-3.6 seconds), with
+at most one outstanding control request. These in-band retries consume no
+pre-auth slots and do not take the shared dial lock. It logs
+`both loopback forwards ready on existing SSH` once `-R` attaches. An already
+attached forward is left alone while its SSH process remains alive; HTTP hub
+failure alone never tears down the tunnel. Directory reports can travel via
+`-L` during reverse-port recovery, so an online directory row can precede inbound
+delivery readiness. Check the readiness log and both delivery directions after
+startup/reconnect. The short forward retry avoids adding minutes after the old
+port becomes free.
+
+Only a real SSH exit triggers a new connection and the slower dial backoff.
+The guard terminates and waits for its owned SSH/control children before the
+next dial; normal cleanup first allows OpenSSH a graceful disconnect before
+falling back to a kill. It cannot force the remote sshd to notice a broken
+network path immediately. `ServerAliveInterval=15`
 and `ServerAliveCountMax=3` detect a dead connection. These are
 [OpenSSH client controls](https://man.openbsd.org/ssh_config.5).
 
@@ -177,7 +214,8 @@ When a laptop disappears, sshd can temporarily retain its old reverse port.
 After reconnecting, the hub's "peer offline" HTTP 503 can refer to that stale
 `-R`, even while the laptop inbox is running. It clears once the old sshd
 session ends and the supervisor successfully binds the replacement forward.
-The supervisor waits and retries; it never forcibly deletes another session's
+The supervisor retains the replacement connection and retries only `-R` over
+it; it never forcibly deletes another session's
 forward. The relay owner can review these server-side recommendations:
 
 ```text
@@ -193,7 +231,7 @@ checks the actual listeners with `ss -lnt` after startup. These are
 [sshd settings](https://man.openbsd.org/sshd_config.5); the build agent does not
 change them.
 
-`ExitOnForwardFailure` only checks forward setup, not whether the ultimate local
+Forward setup only checks the listening port, not whether the ultimate local
 inbox is alive. The hub's bounded POST and 503 handle that case.
 
 ## Protecting the relay's sshd
@@ -209,8 +247,9 @@ times so slow valid clients still have time to authenticate. See the
 Increasing server limits alone does not fix a retry storm. This supervisor
 performs zero route probes, holds the shared host/relay lock for a hard cap of
 one concurrent dial, requests one SSH connection per attempt, bounds dialing,
-and applies the slow jittered backoff above. The lock applies to supervised
-sessions sharing the file on this host; other hosts and administrative SSH
+and applies the slow jittered backoff above. A stale reverse port retries on
+the same authenticated master, without another dial. The lock applies to
+supervised sessions sharing the file on this host; other hosts and administrative SSH
 clients also consume server capacity. Keep an administrative session open and
 verify a separate login before applying an owner-selected sshd reload. The
 build agent changes no relay sshd settings.
@@ -306,8 +345,10 @@ docker run --rm --platform linux/amd64 --name agent-inbox-restricted-sshd \
 The fixture refuses to run outside a root-owned Docker test environment. It
 creates disposable keys and the nologin account only inside that container,
 checks `sshd -t/-T`, real `-N` reverse/local forwarding, exact per-key port limits,
-rejected shell/SFTP/unregistered keys, and local-facts route selection. It
-publishes no host ports. The fixture and `--rm` remove its keys, sockets, logs,
+rejected shell/SFTP/unregistered keys, and local-facts route selection. It also
+runs the current supervisor while another master holds `-R`: repeated in-band
+forward failures keep `-L` working, and releasing the port attaches `-R` without
+a redial. It publishes no host ports. The fixture and `--rm` remove its keys, sockets, logs,
 account and processes after verification.
 
 Remove owned control directories, token/log fixtures and isolated compiler caches

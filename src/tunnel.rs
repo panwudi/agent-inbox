@@ -417,9 +417,39 @@ pub fn supervise() -> Result<()> {
 struct SshChild(Child);
 impl Drop for SshChild {
     fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        // Give OpenSSH a chance to send its disconnect and release remote forwards.
+        // A broken transport may still leave sshd holding its port until server keepalive expiry.
+        unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+fn reverse_forward(ssh: &str, control: &Path, host: &str, forward: &str) -> Result<SshChild> {
+    // -O requires this private master and fails if it is gone. It never authenticates
+    // another connection. Ignore SSH config so its own forward/session directives cannot run.
+    Ok(SshChild(
+        Command::new(ssh)
+            .args(["-F", "/dev/null", "-S"])
+            .arg(control)
+            .args(["-O", "forward", "-R", forward, host])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    ))
+}
+
+fn forward_retry(random: u32) -> Duration {
+    // These requests share the authenticated transport and consume no pre-auth slots.
+    Duration::from_millis(2400 + u64::from(random % 1201))
 }
 
 struct ControlCleanup(PathBuf);
@@ -464,7 +494,13 @@ pub fn worker(mut args: impl Iterator<Item = String>) -> Result<()> {
     }
     let (host, port) = route()?;
     let timeout = positive("INBOX_DIAL_TIMEOUT", 45)?;
-    let mut command = Command::new(value("INBOX_SSH_BIN")?);
+    let ssh = value("INBOX_SSH_BIN")?;
+    let reverse = format!(
+        "127.0.0.1:{}:127.0.0.1:{}",
+        positive("INBOX_REVERSE_PORT", 0)?,
+        positive("INBOX_LOCAL_INBOX_PORT", 0)?
+    );
+    let mut command = Command::new(&ssh);
     command
         .arg("-F")
         .arg(value("INBOX_SSH_CONFIG")?)
@@ -520,12 +556,6 @@ pub fn worker(mut args: impl Iterator<Item = String>) -> Result<()> {
         .arg(value("INBOX_SSH_USER")?)
         .arg("-p")
         .arg(port.to_string())
-        .arg("-R")
-        .arg(format!(
-            "127.0.0.1:{}:127.0.0.1:{}",
-            positive("INBOX_REVERSE_PORT", 0)?,
-            positive("INBOX_LOCAL_INBOX_PORT", 0)?
-        ))
         .arg("-L")
         .arg(format!(
             "127.0.0.1:{}:127.0.0.1:{}",
@@ -536,8 +566,11 @@ pub fn worker(mut args: impl Iterator<Item = String>) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    eprintln!("agent-inbox tunnels: connecting both loopback forwards to {host}:{port}");
+    eprintln!("agent-inbox tunnels: connecting local hub forward to {host}:{port}");
     let mut child = SshChild(command.spawn()?);
+    let mut forwarding: Option<SshChild> = None;
+    let mut forwarded = false;
+    let mut next_forward = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         if STOP.load(Ordering::Relaxed) || unsafe { libc::getppid() } != parent {
@@ -561,6 +594,25 @@ pub fn worker(mut args: impl Iterator<Item = String>) -> Result<()> {
         if lock.is_some() && Instant::now() >= deadline {
             return Err("SSH authentication deadline exceeded".into());
         }
+        if let Some(request) = &mut forwarding
+            && let Some(status) = request.0.try_wait()?
+        {
+            forwarding.take();
+            if status.success() {
+                forwarded = true;
+                eprintln!("agent-inbox tunnels: both loopback forwards ready on existing SSH");
+            } else {
+                let delay = forward_retry(random()?);
+                next_forward = Instant::now() + delay;
+                eprintln!(
+                    "agent-inbox tunnels: reverse forward unavailable ({status}); retrying in {:.3}s on existing SSH; retaining local hub forward",
+                    delay.as_secs_f64()
+                );
+            }
+        }
+        if lock.is_none() && !forwarded && forwarding.is_none() && Instant::now() >= next_forward {
+            forwarding = Some(reverse_forward(&ssh, &control, &host, &reverse)?);
+        }
         std::thread::sleep(POLL);
     }
 }
@@ -568,6 +620,12 @@ pub fn worker(mut args: impl Iterator<Item = String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarding_retries_stay_short_without_another_authentication() {
+        assert_eq!(forward_retry(0), Duration::from_millis(2400));
+        assert_eq!(forward_retry(1200), Duration::from_millis(3600));
+        assert!((2400..=3600).contains(&forward_retry(u32::MAX).as_millis()));
+    }
     #[test]
     fn prefix_matches_both_halves_of_a_23_and_boundary_lengths() {
         let prefix = Prefix::parse("192.168.110.0/23").unwrap();

@@ -13,6 +13,9 @@ use crate::{Result, http, hub, journal, state, token::Token};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
+#[path = "relay_sessions.rs"]
+mod sessions;
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -24,6 +27,8 @@ struct Config {
     tunnel_script: Option<PathBuf>,
     tunnel_env: Option<PathBuf>,
     directory_report_secs: Option<u64>,
+    control_socket: Option<PathBuf>,
+    session_ttl_secs: Option<u64>,
     #[serde(default)]
     agents: Vec<AgentConfig>,
 }
@@ -36,19 +41,32 @@ struct AgentConfig {
     token_file: PathBuf,
     sender_token_file: PathBuf,
 }
+#[derive(Clone)]
 struct Agent {
     inbox: String,
     description: String,
     token: Token,
     sender: Token,
+    session: Option<sessions::Session>,
 }
 
+impl Agent {
+    fn live(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|s| s.expires > Instant::now())
+    }
+}
+
+#[derive(Clone)]
 struct Router {
     host: String,
     hub: String,
     host_token: Token,
     agents: HashMap<String, Agent>,
     log: PathBuf,
+    generation: u64,
+    session_ttl: Duration,
 }
 impl Router {
     fn load(path: &Path) -> Result<(Self, Config)> {
@@ -58,6 +76,9 @@ impl Router {
         hub::validate_component(&config.host)?;
         if !matches!(config.directory_report_secs.unwrap_or(15), 1..=3600) {
             return Err("directory report interval must be 1..3600 seconds".into());
+        }
+        if !matches!(config.session_ttl_secs.unwrap_or(45), 1..=3600) {
+            return Err("session TTL must be 1..3600 seconds".into());
         }
         let central = hub::loopback_endpoint(&config.hub)?;
         let host_token = Token::read(&hub::relative_to(path, config.host_token_file.clone()))?;
@@ -99,6 +120,7 @@ impl Router {
                     description: agent.description.clone(),
                     token,
                     sender,
+                    session: None,
                 },
             );
         }
@@ -113,6 +135,8 @@ impl Router {
                 host_token,
                 agents,
                 log,
+                generation: 0,
+                session_ttl: Duration::from_secs(config.session_ttl_secs.unwrap_or(45)),
             },
             config,
         ))
@@ -124,7 +148,7 @@ impl Router {
             None
         };
         for (name, agent) in &self.agents {
-            if agent.sender.authorizes(header) {
+            if agent.live() && agent.sender.authorizes(header) {
                 identity = Some(http::SenderIdentity::Authenticated(format!(
                     "{}.{name}",
                     self.host
@@ -185,7 +209,7 @@ impl Router {
             return http::Response::new(500, "relay journal failed; message not forwarded");
         }
         let outcome = if let Some(name) = local {
-            let Some(agent) = self.agents.get(name) else {
+            let Some(agent) = self.agents.get(name).filter(|agent| agent.live()) else {
                 return http::Response::new(404, "unknown local agent; message saved");
             };
             http::post(
@@ -240,7 +264,11 @@ fn reachable(address: &str) -> bool {
 }
 
 fn reports(router: &Router) -> Vec<crate::directory::Report> {
-    let entries: Vec<_> = router.agents.iter().collect();
+    let entries: Vec<_> = router
+        .agents
+        .iter()
+        .filter(|(_, agent)| agent.live())
+        .collect();
     let result = Mutex::new(Vec::new());
     let cursor = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -268,28 +296,37 @@ fn directory_loop(path: PathBuf, initial: Config, router: Arc<RwLock<Arc<Router>
     let mut previous = std::fs::read(&path).unwrap_or_default();
     let mut last = None;
     let mut waiting_for_tunnel = false;
+    let mut reported_generation = None;
     while !STOP.load(Ordering::Relaxed) {
         let bytes = std::fs::read(&path).unwrap_or_default();
         let mut changed = false;
         if bytes != previous {
             match Router::load(&path) {
-                Ok((next, config)) => {
-                    let current = router.read().unwrap();
+                Ok((mut next, config)) => {
+                    // Merge and replacement are one mutation with registration/heartbeats.
+                    let mut current = router.write().unwrap();
                     let same = next.host == current.host
                         && next.hub == current.hub
                         && bool::from(next.host_token.bytes().ct_eq(current.host_token.bytes()))
                         && config.tunnel_script == initial.tunnel_script
                         && config.tunnel_env == initial.tunnel_env
                         && config.state_dir == initial.state_dir;
-                    drop(current);
-                    if same {
-                        *router.write().unwrap() = Arc::new(next);
-                        changed = true;
-                        eprintln!("agent-inbox: relay agent configuration reloaded");
-                    } else {
+                    let same = same
+                        && config.control_socket == initial.control_socket
+                        && config.session_ttl_secs == initial.session_ttl_secs;
+                    let merge = sessions::preserve(&mut next, &current);
+                    if !same {
                         eprintln!(
                             "agent-inbox: relay identity/tunnel changes require a service restart"
                         );
+                    } else if merge.is_err() {
+                        eprintln!(
+                            "agent-inbox: static relay configuration conflicts with live sessions or capacity; retaining active routing"
+                        );
+                    } else {
+                        *current = Arc::new(next);
+                        changed = true;
+                        eprintln!("agent-inbox: relay agent configuration reloaded");
                     }
                 }
                 Err(_) => eprintln!(
@@ -299,6 +336,9 @@ fn directory_loop(path: PathBuf, initial: Config, router: Arc<RwLock<Arc<Router>
             previous = bytes;
         }
         if changed
+            || router
+                .read()
+                .is_ok_and(|current| Some(current.generation) != reported_generation)
             || last.is_none_or(|when: Instant| {
                 when.elapsed() >= Duration::from_secs(initial.directory_report_secs.unwrap_or(15))
             })
@@ -315,8 +355,15 @@ fn directory_loop(path: PathBuf, initial: Config, router: Arc<RwLock<Arc<Router>
                 Duration::from_secs(20),
             ) {
                 Ok((200, _)) => {
+                    if waiting_for_tunnel {
+                        eprintln!(
+                            "agent-inbox: directory hub connection restored at {}; report accepted",
+                            current.hub
+                        );
+                    }
                     waiting_for_tunnel = false;
                     last = Some(Instant::now());
+                    reported_generation = Some(current.generation);
                 }
                 Ok((status, reason)) => {
                     waiting_for_tunnel = false;
@@ -331,7 +378,10 @@ fn directory_loop(path: PathBuf, initial: Config, router: Arc<RwLock<Arc<Router>
                         == "cannot connect to inbox; message was not confirmed" =>
                 {
                     if !waiting_for_tunnel {
-                        eprintln!("agent-inbox: directory waiting for tunnel");
+                        eprintln!(
+                            "agent-inbox: directory waiting for tunnel: cannot connect to hub at {}",
+                            current.hub
+                        );
                     }
                     waiting_for_tunnel = true;
                     last = None;
@@ -476,16 +526,28 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         control.store(false, Ordering::Release);
     });
     let router = Arc::new(RwLock::new(Arc::new(router)));
+    let socket = match initial.control_socket.clone() {
+        Some(socket) => hub::relative_to(&path, socket),
+        None => crate::local_control::default_path(address.port())?,
+    };
+    let registrations = Arc::clone(&router);
+    let expiry = Arc::clone(&router);
+    let _local = crate::local_control::Server::start(
+        socket,
+        Arc::new(move |value| sessions::apply(&registrations, value)),
+        Arc::new(move || sessions::expire(&expiry)),
+    )?;
     let registry = Arc::clone(&router);
     std::thread::spawn(move || directory_loop(path, initial, registry));
     let auth = Arc::clone(&router);
     let authenticate = Arc::new(move |header: &[u8]| auth.read().ok()?.authenticate(header));
     let handler = Arc::new(
-        move |path: &str, text: &str, sender: Option<&str>, origin: http::Origin| match router
-            .read()
-        {
-            Ok(router) => router.forward(path, text, sender, origin),
-            Err(_) => http::Response::new(500, "relay routing unavailable"),
+        move |path: &str, text: &str, sender: Option<&str>, origin: http::Origin| {
+            let snapshot = router.read().map(|router| Arc::clone(&router));
+            match snapshot {
+                Ok(router) => router.forward(path, text, sender, origin),
+                Err(_) => http::Response::new(500, "relay routing unavailable"),
+            }
         },
     );
     eprintln!("agent-inbox: listening on http://{address}/");

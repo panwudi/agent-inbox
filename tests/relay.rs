@@ -50,7 +50,7 @@ impl Temp {
     fn relay_config(&self, name: &str, hub: &str, inbox: &str) -> PathBuf {
         let agent = if name == "alpha" { "alice" } else { "bob" };
         let config = format!(
-            "host='{name}'\nhub='{hub}'\nhost_token_file='{name}.host'\njournal='{name}.md'\ndirectory_report_secs=1\n[[agents]]\nname='{agent}'\ndescription='Owns {agent} test work'\ninbox='{inbox}'\ntoken_file='{agent}.in'\nsender_token_file='{agent}.send'\n"
+            "host='{name}'\nhub='{hub}'\nhost_token_file='{name}.host'\njournal='{name}.md'\ncontrol_socket='control/{name}.sock'\ndirectory_report_secs=1\n[[agents]]\nname='{agent}'\ndescription='Owns {agent} test work'\ninbox='{inbox}'\ntoken_file='{agent}.in'\nsender_token_file='{agent}.send'\n"
         );
         let path = self.0.join(format!("{name}.toml"));
         std::fs::write(&path, config).unwrap();
@@ -444,7 +444,7 @@ fn mixed_legacy_sender_and_host_relay_deliver_both_directions_and_ack_reports() 
     let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
     let central = reserved.local_addr().unwrap().to_string();
     let config = temp.0.join("mixed-relay.toml");
-    std::fs::write(&config, format!("host='laptop1'\nhub='{central}'\nhost_token_file='alpha.host'\njournal='relay.md'\ndirectory_report_secs=1\n[[agents]]\nname='main-review'\ndescription='Main review session'\ninbox='{}'\ntoken_file='alice.in'\nsender_token_file='alice.send'\n", new.address)).unwrap();
+    std::fs::write(&config, format!("host='laptop1'\nhub='{central}'\nhost_token_file='alpha.host'\njournal='relay.md'\ncontrol_socket='control/laptop1.sock'\ndirectory_report_secs=1\n[[agents]]\nname='main-review'\ndescription='Main review session'\ninbox='{}'\ntoken_file='alice.in'\nsender_token_file='alice.send'\n", new.address)).unwrap();
     let relay = Process::relay(&temp, &config, "0");
     let config = temp.0.join("mixed-hub.toml");
     std::fs::write(&config, format!("journal='mixed-hub.md'\n[[senders]]\nname='main-review'\ntoken_file='bob.send'\n[[peers]]\nname='main-review'\ninbox='{}'\ntoken_file='bob.in'\n[[hosts]]\nname='laptop1'\nrelay='{}'\ntoken_file='alpha.host'\n", old.address, relay.address)).unwrap();

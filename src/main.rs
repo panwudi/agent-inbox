@@ -7,9 +7,12 @@ use agent_inbox::{
 };
 
 const USAGE: &str = "agent-inbox claude --listen <addr> --token-file <path> [--log <path>]\n\
+agent-inbox claude --relay <local-relay-addr> [--name <name>] [--description <text>]\n\
 agent-inbox hub --listen <loopback-addr> --config <toml> [--log <path>]\n\
 agent-inbox relay --listen <loopback-addr> --config <toml>\n\
 agent-inbox codex --thread <id> --listen <addr> --token-file <path> [--log <path>]\n\
+agent-inbox codex-watch --config <toml>\n\
+agent-inbox codex-self [--thread <id>] [--state-dir <watcher-state>]\n\
 agent-inbox send <http-address> --token-file <path> [--from <name>] [--log <path>] <text>\n\
 agent-inbox send --hub <addr> --to <logical-name> --token-file <my-hub-token> [--log <path>] <text>\n\
 agent-inbox steer --thread <id> [options] <text>\n\
@@ -46,6 +49,12 @@ fn run() -> Result<()> {
         Some("steer") => {}
         Some("claude") => return claude::run(args),
         Some("codex") => return codex_inbox::run(args),
+        #[cfg(unix)]
+        Some("codex-watch") => return agent_inbox::codex_watch::run(args),
+        #[cfg(unix)]
+        Some("codex-worker") => return agent_inbox::codex_auto::run(args),
+        #[cfg(unix)]
+        Some("codex-self") => return agent_inbox::codex_watch::own_status(args),
         Some("send") => return send(args),
         Some("hub") => return hub::run(args),
         #[cfg(unix)]

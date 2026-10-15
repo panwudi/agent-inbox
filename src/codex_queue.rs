@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,7 @@ pub struct Queue {
     data: Mutex<Snapshot>,
     changed: Condvar,
     _lock: File,
+    notifying: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -82,6 +84,8 @@ pub struct Backend {
     pub token_file: PathBuf,
     pub notify: Option<PathBuf>,
     pub notify_args: Vec<String>,
+    pub routing_context: Option<String>,
+    pub running: Arc<AtomicBool>,
 }
 
 impl Queue {
@@ -134,6 +138,7 @@ impl Queue {
             data: Mutex::new(data),
             changed: Condvar::new(),
             _lock: lock,
+            notifying: AtomicBool::new(false),
         }))
     }
 
@@ -306,6 +311,9 @@ impl Queue {
         std::thread::spawn(move || {
             let mut delay = 1;
             loop {
+                if !backend.running.load(Ordering::Acquire) {
+                    break;
+                }
                 if queue.is_held() {
                     let id = queue.head().map(|item| item.id);
                     queue.wait(id.as_deref(), Duration::from_millis(500));
@@ -342,7 +350,7 @@ impl Queue {
     }
 
     fn attempt(&self, backend: &Backend, item: &Pending) -> Result<()> {
-        if self.is_held() {
+        if self.is_held() || !backend.running.load(Ordering::Acquire) {
             return Err(Held.into());
         }
         if item.phase == Phase::Blocked {
@@ -384,12 +392,22 @@ impl Queue {
                 }
             }
         }
+        // Local routing hints do not enlarge the durable message or its 64 KiB limit.
+        let text = backend
+            .routing_context
+            .as_ref()
+            .map(|context| format!("{context}{}", item.text));
         let result = client.deliver_tracked(
             &backend.thread,
             &item.sender,
-            &item.text,
+            text.as_deref().unwrap_or(&item.text),
             Some(&item.id),
-            || self.begin(&item.id),
+            || {
+                if !backend.running.load(Ordering::Acquire) {
+                    return Err(Held.into());
+                }
+                self.begin(&item.id)
+            },
         );
         match result {
             Ok(delivery) => self.delivered(&item.id, &delivery.turn),
@@ -452,13 +470,33 @@ impl Queue {
         );
         journal::append(&backend.log, "agent-inbox", &backend.thread, &text)?;
         let report = json!({"event":"codexDeliveryBlocked","thread":backend.thread,"messageId":item.id,"reason":item.reason,"fifoBlocked":true,"resend":format!("{base} --resend {}",item.id),"drop":format!("{base} --drop {}",item.id)});
-        notify(backend.notify.as_deref(), &backend.notify_args, &report)?;
+        self.notifying.store(true, Ordering::Release);
+        struct Active<'a>(&'a AtomicBool);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _active = Active(&self.notifying);
+        notify_running(
+            backend.notify.as_deref(),
+            &backend.notify_args,
+            &report,
+            Some(&backend.running),
+        )?;
         self.edit(|data| {
             if let Some(head) = data.pending.front_mut().filter(|head| head.id == item.id) {
                 head.notified = true;
             }
             Ok(())
         })
+    }
+    pub fn finish_notifier(&self) {
+        self.changed.notify_all();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while self.notifying.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -478,6 +516,18 @@ impl Drop for NotifyChild {
 }
 
 pub fn notify(command: Option<&std::path::Path>, args: &[String], report: &Value) -> Result<()> {
+    notify_running(command, args, report, None)
+}
+
+fn notify_running(
+    command: Option<&std::path::Path>,
+    args: &[String],
+    report: &Value,
+    running: Option<&AtomicBool>,
+) -> Result<()> {
+    if running.is_some_and(|r| !r.load(Ordering::Acquire)) {
+        return Err("inbox stopped before notification".into());
+    }
     let Some(command) = command else {
         eprintln!("agent-inbox notice: {report}");
         return Ok(());
@@ -504,6 +554,9 @@ pub fn notify(command: Option<&std::path::Path>, args: &[String], report: &Value
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        if running.is_some_and(|r| !r.load(Ordering::Acquire)) {
+            return Err("inbox stopped during notification".into());
+        }
         if let Some(status) = child.try_wait()? {
             stop_notify_group(child.id());
             writer.join().map_err(|_| "notify writer failed")?;

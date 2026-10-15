@@ -3,7 +3,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{Value, json};
 
@@ -58,10 +58,16 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let mut reply_thread = None;
     let mut hub_address = None;
     let mut hub_token_file = None;
+    let mut relay = None;
+    let mut control_socket = None;
+    let mut session_dir = None;
+    let mut description = None;
+    let mut named = false;
+    let mut explicit_token = false;
     while let Some(flag) = args.next() {
         if flag == "--help" || flag == "-h" {
             println!(
-                "agent-inbox claude --listen <addr> --token-file <path> [--log <path>] [--name <receiver>] [--from <default-sender>] [--reply-thread <id> | --hub <addr> --hub-token-file <path>]"
+                "agent-inbox claude --relay <local-relay-addr> [--name <name>] [--description <text>] [--control-socket <path>] [--session-dir <path>] [--log <path>]\nagent-inbox claude --listen <addr> --token-file <path> [--log <path>] [--name <receiver>] [--from <default-sender>] [--reply-thread <id> | --hub <addr> --hub-token-file <path>]"
             );
             return Ok(());
         }
@@ -75,6 +81,10 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
                 | "--reply-thread"
                 | "--hub"
                 | "--hub-token-file"
+                | "--relay"
+                | "--control-socket"
+                | "--session-dir"
+                | "--description"
         ) {
             return Err(format!("unknown claude option {flag}").into());
         }
@@ -83,15 +93,50 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
             "--listen" => listen = Some(http::listen_address(&value)?),
-            "--token-file" => token_file = Some(PathBuf::from(value)),
+            "--token-file" => {
+                explicit_token = true;
+                token_file = Some(PathBuf::from(value));
+            }
             "--log" => log = Some(PathBuf::from(value)),
-            "--name" => name = value,
+            "--name" => {
+                named = true;
+                name = value;
+            }
             "--from" => sender = value,
             "--reply-thread" => reply_thread = Some(value),
             "--hub" => hub_address = Some(value),
             "--hub-token-file" => hub_token_file = Some(PathBuf::from(value)),
+            "--relay" => relay = Some(value),
+            "--control-socket" => control_socket = Some(PathBuf::from(value)),
+            "--session-dir" => session_dir = Some(PathBuf::from(value)),
+            "--description" => description = Some(value),
             _ => unreachable!(),
         }
+    }
+    if let Some(relay) = relay {
+        if listen.is_some()
+            || explicit_token
+            || hub_address.is_some()
+            || hub_token_file.is_some()
+            || reply_thread.is_some()
+        {
+            return Err("--relay uses an ephemeral loopback inbox and fresh credentials; cannot combine manual inbox/reply options".into());
+        }
+        #[cfg(unix)]
+        return run_join(
+            relay,
+            control_socket,
+            session_dir,
+            log,
+            if named { Some(name) } else { None },
+            description,
+            sender,
+        );
+        #[cfg(not(unix))]
+        return Err("auto-join requires macOS/Linux local peer credentials".into());
+    }
+    if control_socket.is_some() || session_dir.is_some() || description.is_some() {
+        return Err("auto-join options require --relay".into());
     }
     validate_message(&name, &sender, "configuration")?;
     let mut instructions = INSTRUCTIONS.to_owned();
@@ -137,42 +182,182 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let http_state = Arc::clone(&state);
     let handler = Arc::new(move |text: &str, from: Option<&str>| {
-        let from = from.unwrap_or(&sender);
-        let sent = match journal::append(&log, from, &name, text) {
-            Ok(sent) => sent,
-            Err(_) => {
-                eprintln!("agent-inbox: message journal write failed; delivery skipped");
-                return http::Response::new(500, "journal write failed; message was not delivered");
-            }
-        };
-        let mut state = match http_state.lock() {
-            Ok(state) => state,
-            Err(_) => return http::Response::new(503, "message saved; channel unavailable"),
-        };
-        let message = notification(text, from, &sent);
-        if !state.ready {
-            if state.pending.len() >= 64 {
-                return http::Response::new(503, "message saved; pending queue full");
-            }
-            state.pending.push_back(message);
-            return http::Response::new(202, "message saved; awaiting channel initialization");
-        }
-        match state.send(&message) {
-            Ok(()) => http::Response::new(200, "delivered to the Claude session"),
-            Err(_) => http::Response::new(503, "message saved; channel delivery failed"),
-        }
+        accept_message(&http_state, &log, &name, from.unwrap_or(&sender), text)
     });
     let http_running = Arc::clone(&running);
     let server = std::thread::spawn(move || http::serve(listener, token, http_running, handler));
     eprintln!("agent-inbox: listening on http://{address}/");
-    let result = read_mcp(std::io::stdin().lock(), &state, &instructions);
+    let result = read_mcp(std::io::stdin().lock(), &state, &instructions, None);
     running.store(false, Ordering::Release);
     let server_result = server.join().map_err(|_| "HTTP listener panicked")?;
     result?;
     server_result
 }
 
-fn read_mcp(mut input: impl BufRead, state: &Arc<Mutex<State>>, instructions: &str) -> Result<()> {
+#[cfg(unix)]
+static JOIN_STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+extern "C" fn stop_join(_: libc::c_int) {
+    JOIN_STOP.store(true, Ordering::Release);
+}
+
+#[cfg(unix)]
+fn run_join(
+    relay: String,
+    socket: Option<PathBuf>,
+    sessions: Option<PathBuf>,
+    log: Option<PathBuf>,
+    name: Option<String>,
+    description: Option<String>,
+    sender: String,
+) -> Result<()> {
+    use crate::claude_join::{Credentials, Join};
+    let relay = crate::hub::loopback_endpoint(&relay)?;
+    let address: SocketAddr = relay.parse()?;
+    let socket = socket
+        .map(Ok)
+        .unwrap_or_else(|| crate::local_control::default_path(address.port()))?;
+    let sessions = sessions
+        .map(Ok)
+        .unwrap_or_else(crate::claude_join::default_sessions)?;
+    let name = name
+        .map(Ok)
+        .unwrap_or_else(crate::claude_join::default_name)?;
+    crate::hub::validate_component(&name)?;
+    let description = description.unwrap_or_else(|| format!("Claude session in {name}"));
+    crate::directory::description(&description)?;
+    validate_message(&name, &sender, "configuration")?;
+    let log = log.map(Ok).unwrap_or_else(journal::default_path)?;
+    let credentials = Credentials::create(&sessions)?;
+    let token = credentials.inbox.clone();
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let state = Arc::new(Mutex::new(State {
+        output: Box::new(std::io::stdout()),
+        initialized: false,
+        ready: false,
+        pending: VecDeque::new(),
+    }));
+    let receiver = Arc::new(RwLock::new(name.clone()));
+    let notice_state = Arc::clone(&state);
+    let notice_receiver = Arc::clone(&receiver);
+    let notice_log = log.clone();
+    let join = Join::start(
+        socket,
+        relay,
+        address.to_string(),
+        credentials,
+        name,
+        description,
+        Arc::new(move |profile| {
+            if let Some(name) = &profile.name
+                && let Ok(mut receiver) = notice_receiver.write()
+            {
+                *receiver = name.clone();
+            }
+            let name = profile.name.as_deref().unwrap_or("pending registration");
+            let text = if profile.registered {
+                format!(
+                    "Local auto-join: registered as {name}. Use inbox_profile to read or update this session's profile."
+                )
+            } else {
+                format!(
+                    "Local auto-join: waiting for the relay; last name {name}. Messages remain in the inbox journal. Use inbox_profile to inspect status."
+                )
+            };
+            let _ = accept_message(&notice_state, &notice_log, name, "agent-inbox", &text);
+        }),
+    )?;
+    let instructions = format!("{INSTRUCTIONS}{}", join.inner.instructions());
+    let running = Arc::new(AtomicBool::new(true));
+    JOIN_STOP.store(false, Ordering::Release);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        if unsafe { libc::signal(signal, stop_join as *const () as libc::sighandler_t) }
+            == libc::SIG_ERR
+        {
+            return Err("cannot install inbox shutdown handler".into());
+        }
+    }
+    let http_state = Arc::clone(&state);
+    let handler = Arc::new(move |text: &str, from: Option<&str>| {
+        let name = receiver
+            .read()
+            .map(|name| name.clone())
+            .unwrap_or_else(|_| "claude".into());
+        accept_message(&http_state, &log, &name, from.unwrap_or(&sender), text)
+    });
+    let http_running = Arc::clone(&running);
+    let server = std::thread::spawn(move || http::serve(listener, token, http_running, handler));
+    eprintln!("agent-inbox: listening on http://{address}/");
+    let tool_inner = Arc::clone(&join.inner);
+    let tool: Arc<ProfileTool> = Arc::new(move |args| tool_inner.tool(args));
+    let (sent, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = read_mcp(
+            std::io::stdin().lock(),
+            &state,
+            &instructions,
+            Some(tool.as_ref()),
+        );
+        let _ = sent.send(result);
+    });
+    let result = loop {
+        if JOIN_STOP.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        match done.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break Err("MCP reader stopped unexpectedly".into()),
+        }
+    };
+    running.store(false, Ordering::Release);
+    drop(join);
+    let server_result = server.join().map_err(|_| "HTTP listener panicked")?;
+    result?;
+    server_result
+}
+
+fn accept_message(
+    state: &Arc<Mutex<State>>,
+    log: &std::path::Path,
+    name: &str,
+    from: &str,
+    text: &str,
+) -> http::Response {
+    let sent = match journal::append(log, from, name, text) {
+        Ok(sent) => sent,
+        Err(_) => {
+            eprintln!("agent-inbox: message journal write failed; delivery skipped");
+            return http::Response::new(500, "journal write failed; message was not delivered");
+        }
+    };
+    let mut state = match state.lock() {
+        Ok(state) => state,
+        Err(_) => return http::Response::new(503, "message saved; channel unavailable"),
+    };
+    let message = notification(text, from, &sent);
+    if !state.ready {
+        if state.pending.len() >= 64 {
+            return http::Response::new(503, "message saved; pending queue full");
+        }
+        state.pending.push_back(message);
+        return http::Response::new(202, "message saved; awaiting channel initialization");
+    }
+    match state.send(&message) {
+        Ok(()) => http::Response::new(200, "delivered to the Claude session"),
+        Err(_) => http::Response::new(503, "message saved; channel delivery failed"),
+    }
+}
+
+type ProfileTool = dyn Fn(&Value) -> Result<Value> + Send + Sync;
+
+fn read_mcp(
+    mut input: impl BufRead,
+    shared: &Arc<Mutex<State>>,
+    instructions: &str,
+    tool: Option<&ProfileTool>,
+) -> Result<()> {
     loop {
         let mut line = Vec::new();
         input
@@ -188,14 +373,14 @@ fn read_mcp(mut input: impl BufRead, state: &Arc<Mutex<State>>, instructions: &s
         let request: Value = match serde_json::from_slice(&line) {
             Ok(value) => value,
             Err(_) => {
-                state
+                shared
                     .lock()
                     .map_err(|_| "channel lock failed")?
                     .send(&error(Value::Null, -32700, "Parse error"))?;
                 continue;
             }
         };
-        let mut state = state.lock().map_err(|_| "channel lock failed")?;
+        let mut state = shared.lock().map_err(|_| "channel lock failed")?;
         let method = request["method"].as_str();
         let id = request.get("id").filter(|id| !id.is_null()).cloned();
         if method == Some("notifications/initialized") && id.is_none() {
@@ -214,6 +399,31 @@ fn read_mcp(mut input: impl BufRead, state: &Arc<Mutex<State>>, instructions: &s
         let Some(id) = id else {
             continue;
         };
+        if method == Some("tools/call")
+            && state.initialized
+            && let Some(tool) = tool
+        {
+            if request["params"]["name"] != "inbox_profile" {
+                state.send(&error(id, -32602, "Unknown tool"))?;
+                continue;
+            }
+            // Profile operations can announce a change back onto this channel.
+            // Do not hold the output mutex while doing local control I/O.
+            drop(state);
+            let result = match tool(request["params"].get("arguments").unwrap_or(&json!({}))) {
+                Ok(value) => {
+                    json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false})
+                }
+                Err(_) => {
+                    json!({"content":[{"type":"text","text":"Profile update unconfirmed or rejected. Query inbox_profile with {} to inspect the current name/status; check the local relay and name/description limits."}],"isError":true})
+                }
+            };
+            shared
+                .lock()
+                .map_err(|_| "channel lock failed")?
+                .send(&json!({"jsonrpc":"2.0","id":id,"result":result}))?;
+            continue;
+        }
         let response = match method.unwrap() {
             "initialize" if !state.initialized => {
                 state.initialized = true;
@@ -225,7 +435,13 @@ fn read_mcp(mut input: impl BufRead, state: &Arc<Mutex<State>>, instructions: &s
             "initialize" => error(id, -32600, "Already initialized"),
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             _ if !state.initialized => error(id, -32002, "Not initialized"),
-            "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}),
+            "tools/list" => {
+                json!({"jsonrpc": "2.0", "id": id, "result": {"tools": if tool.is_some() {vec![json!({
+                "name":"inbox_profile","description":"Read this session's relay name/status, or rename it and set its one-line description. Numeric suffixes resolve collisions. Updates affect this session only.",
+                "inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Local name only, without the host prefix. ASCII letters, digits, underscores and hyphens; starts with a letter or digit.","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$","minLength":1,"maxLength":63},"description":{"type":"string","description":"One nonempty line, at most 512 UTF-8 bytes.","minLength":1,"maxLength":512}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+            })]} else {vec![]}}})
+            }
             _ => error(id, -32601, "Method not found"),
         };
         state.send(&response)?;
@@ -236,7 +452,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 

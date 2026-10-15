@@ -87,6 +87,8 @@ impl Fixture {
             .arg(self.root.join("tunnel.env"))
             .env("INBOX_FAKE_SSH_LOG", self.root.join("calls.log"))
             .env("INBOX_FAKE_SSH_BEHAVIOR", behavior)
+            .env("INBOX_FAKE_REVERSE_BUSY", self.root.join("reverse.busy"))
+            .env("INBOX_FAKE_DROP", self.root.join("drop.now"))
             .env("INBOX_FAKE_FACTS_FILE", self.root.join("facts.txt"));
         for name in [
             "INBOX_BACKOFF_INITIAL",
@@ -298,6 +300,7 @@ fn shared_flock_serializes_dials_and_releases_for_established_tunnels() {
     let auth = first.wait_rows("auth", 1, 5);
     let next = second.wait_rows("dial", 1, 5);
     second.wait_rows("auth", 1, 5);
+    first.wait_rows("reverse-ready", 1, 5);
     assert!(next[0][1].parse::<u128>().unwrap() >= auth[0][1].parse::<u128>().unwrap());
     assert!(alive(&dial[0][2]));
     assert!(alive(&next[0][2]));
@@ -439,16 +442,26 @@ fn gentle_retry_waits_with_jitter_and_reselects_from_fresh_local_facts() {
 }
 
 fn relay_fixture(fixture: &Fixture) -> Supervisor {
+    relay_fixture_at(
+        fixture,
+        &fixture.ports[3].local_addr().unwrap().to_string(),
+        "hold",
+    )
+}
+
+fn relay_fixture_at(fixture: &Fixture, hub: &str, behavior: &str) -> Supervisor {
     let token = fixture.root.join("host.token");
     std::fs::write(&token, "fixture-relay-host-token-private").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config = fixture.root.join("relay.toml");
-    std::fs::write(&config,format!("host='fixture'\nhub='{}'\nhost_token_file='host.token'\njournal='relay.md'\nstate_dir='state'\ntunnel_env='tunnel.env'\ntunnel_script='{}'\n",fixture.ports[3].local_addr().unwrap(),Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/agent-inbox-tunnels.sh").display())).unwrap();
+    std::fs::write(&config,format!("host='fixture'\nhub='{hub}'\nhost_token_file='host.token'\njournal='relay.md'\ncontrol_socket='control/relay.sock'\nstate_dir='state'\ntunnel_env='tunnel.env'\ntunnel_script='{}'\n",Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/agent-inbox-tunnels.sh").display())).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-inbox"))
         .args(["relay", "--listen", "0", "--config"])
         .arg(config)
         .env("INBOX_FAKE_SSH_LOG", fixture.root.join("calls.log"))
-        .env("INBOX_FAKE_SSH_BEHAVIOR", "hold")
+        .env("INBOX_FAKE_SSH_BEHAVIOR", behavior)
+        .env("INBOX_FAKE_REVERSE_BUSY", fixture.root.join("reverse.busy"))
+        .env("INBOX_FAKE_DROP", fixture.root.join("drop.now"))
         .env("INBOX_FAKE_FACTS_FILE", fixture.root.join("facts.txt"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -494,4 +507,93 @@ fn relay_crash_is_detected_by_its_supervisor_parent_guard() {
     wait_dead(&supervisor);
     let socket = rows[0].windows(2).find(|pair| pair[0] == "-S").unwrap();
     assert!(!Path::new(&socket[1]).parent().unwrap().exists());
+}
+
+#[test]
+fn lingering_reverse_port_keeps_master_and_directory_live_then_attaches_without_redial() {
+    let mut fixture = Fixture::new();
+    let hub_forward = fixture.ports[2].local_addr().unwrap().to_string();
+    drop(fixture.ports.remove(2));
+    fixture.append("INBOX_DIAL_TIMEOUT=1");
+    std::fs::write(
+        fixture.root.join("reverse.busy"),
+        "previous sshd still owns -R",
+    )
+    .unwrap();
+    let mut relay = relay_fixture_at(&fixture, &hub_forward, "serve-hub");
+    relay.wait_error("directory waiting for tunnel");
+    let busy = fixture.wait_rows("reverse-busy", 1, 5);
+    fixture.wait_rows("report", 1, 5);
+    relay.wait_error("directory hub connection restored");
+    assert!(fixture.rows("reverse-ready").is_empty());
+    assert_eq!(fixture.rows("dial").len(), 1);
+
+    // A busy -R must not hold the authentication lock or block another session's dial.
+    let other = Fixture::new();
+    other.share_lock(&fixture);
+    let mut second = other.supervisor("hold");
+    other.wait_rows("auth", 1, 5);
+    second.stop();
+    // Keep the old reverse port across multiple requests, not just a single startup failure.
+    fixture.wait_rows("reverse-busy", 2, 6);
+    std::fs::remove_file(fixture.root.join("reverse.busy")).unwrap();
+    let ready = fixture.wait_rows("reverse-ready", 1, 6);
+    relay.wait_error("both loopback forwards ready on existing SSH");
+    assert_eq!(ready[0][2], busy[0][2]);
+    assert!(alive(&ready[0][2]));
+    assert_eq!(fixture.rows("dial").len(), 1);
+    assert_eq!(fixture.rows("auth").len(), 1);
+    assert!(fixture.rows("initial-reverse-collision").is_empty());
+    let reports = fixture.rows("report");
+    assert!(reports[0][1].parse::<u128>().unwrap() < ready[0][1].parse::<u128>().unwrap());
+    let requests = fixture.rows("forward");
+    for pair in requests.windows(2) {
+        let gap = pair[1][1].parse::<u128>().unwrap() - pair[0][1].parse::<u128>().unwrap();
+        assert!((2400..=4500).contains(&gap), "forward retry gap {gap}ms");
+    }
+    assert!(
+        relay
+            .1
+            .try_iter()
+            .all(|line| !line.contains("directory waiting") && !line.contains("SSH ended"))
+    );
+    relay.stop();
+    wait_dead(&ready[0][2]);
+    wait_dead(&ready[0][3]);
+}
+
+#[test]
+fn real_drop_reaps_owned_ssh_before_redial_and_stale_reverse_does_not_kill_replacement() {
+    let fixture = Fixture::new();
+    let mut supervisor = fixture.supervisor("hold");
+    let first = fixture.wait_rows("reverse-ready", 1, 5);
+    std::fs::write(
+        fixture.root.join("reverse.busy"),
+        "remote sshd still owns reverse port",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("drop.now"), "drop first SSH").unwrap();
+    fixture.wait_rows("drop", 1, 5);
+    wait_dead(&first[0][2]);
+    std::fs::remove_file(fixture.root.join("drop.now")).unwrap();
+    let replacement = fixture.wait_rows("reverse-busy", 1, 25);
+    assert_ne!(first[0][2], replacement[0][2]);
+    assert_eq!(fixture.rows("dial").len(), 2);
+    std::fs::remove_file(fixture.root.join("reverse.busy")).unwrap();
+    let ready = fixture.wait_rows("reverse-ready", 2, 6);
+    assert_eq!(ready[1][2], replacement[0][2]);
+    assert_eq!(fixture.rows("dial").len(), 2);
+    supervisor.stop();
+    wait_dead(&ready[1][2]);
+}
+
+#[test]
+fn stopping_during_pending_multiplex_request_stops_both_children() {
+    let fixture = Fixture::new();
+    let mut supervisor = fixture.supervisor("hang-forward");
+    let master = fixture.wait_rows("auth", 1, 5);
+    let requests = fixture.wait_rows("forward", 1, 5);
+    supervisor.stop();
+    wait_dead(&requests[0][2]);
+    wait_dead(&master[0][2]);
 }

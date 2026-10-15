@@ -14,7 +14,9 @@ pub struct Client {
 
 impl Client {
     pub fn connect(codex: &Path, socket: &Path, timeout: Duration) -> Result<Self> {
-        let stream = ProxyStream::spawn(codex, socket, timeout)?;
+        let stream = ProxyStream::spawn(codex, socket, timeout).map_err(|error| {
+            format!("WebSocket handshake through codex app-server proxy failed: {error}")
+        })?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(8 * 1024 * 1024))
             .max_frame_size(Some(8 * 1024 * 1024));

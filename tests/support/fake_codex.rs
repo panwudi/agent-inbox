@@ -14,6 +14,10 @@ fn main() -> std::io::Result<()> {
             std::io::copy(&mut std::io::stdin().lock(), &mut file)?;
             return Ok(());
         }
+        if args == ["test-blocking-notify"] {
+            std::fs::write(root.join("notify.pid"),std::process::id().to_string())?;
+            loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+        }
         if args == ["app-server", "daemon", "version"] {
             let file = if root.join("updated").exists() { "after.json" } else { "before.json" };
             print!("{}", std::fs::read_to_string(root.join(file))?);

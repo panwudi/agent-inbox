@@ -160,10 +160,22 @@ was accepted. Check `who` and the relay's response diagnostic.
 The report waits up to 20 seconds for a response over a public SSH path. Warnings
 include HTTP status and known static reason strings, or a transport timeout.
 While the local hub forward refuses connections during startup or reconnect,
-the relay logs `directory waiting for tunnel` once and keeps checking quietly.
-An answered request resets this waiting state; actual rejection/timeouts remain
-visible. A not-yet-established forward is distinct from a rejected report.
+the relay logs `directory waiting for tunnel` once with the actual hub address,
+and keeps checking quietly. This comes from the report's real TCP connection,
+not the supervisor's state or whether `-R` has attached. A successful report logs
+`directory hub connection restored` and clears the waiting state; actual
+rejection/timeouts remain visible. A not-yet-established forward is distinct from a rejected report.
 Hub forwarding rejections include the downstream status/reason in the service
 log. Unknown response bodies are omitted to keep content and credentials out of
 logs. A successful status remains sufficient acknowledgement; diagnostics do
 not wait for a success response body.
+
+The supervisor brings up `-L` before requesting `-R`. If a previous sshd still
+holds the reverse port, reports can succeed immediately through the retained
+`-L`, while only the reverse-forward request retries every 2.4-3.6 seconds on
+that same SSH connection. The directory describes recent host reports and local
+inbox reachability, so an online row alone does not prove the reverse port is
+ready. Inbound sends can return 503 during that recovery window. The log
+`both loopback forwards ready on existing SSH` confirms attachment. Verify
+delivery in both directions after reconnect; do not restart a healthy supervisor
+to reclaim a stale remote port.

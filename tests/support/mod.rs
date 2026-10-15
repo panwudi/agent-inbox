@@ -31,6 +31,14 @@ pub fn fake_codex() -> PathBuf {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            // Prepare a freshly compiled executable before concurrent one-second
+            // RPC budgets, so first-start overhead belongs to fixture setup.
+            let warmup = Command::new(&path)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(warmup.status.success(), "fake Codex failed to start");
             #[cfg(unix)]
             unsafe {
                 libc::atexit(cleanup);
