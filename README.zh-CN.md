@@ -488,3 +488,4 @@ CODEX_THREAD_ID=<thread-id> cargo test --test steer real_daemon_read_only -- --i
 ## 许可证
 
 [MIT](LICENSE)
+中文，句号。
