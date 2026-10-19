@@ -20,13 +20,17 @@ struct Config {
     state_file: PathBuf,
     #[serde(default = "yes")]
     start_at_end: bool,
+    #[serde(default)]
     routes: Vec<Route>,
+    #[serde(default)]
+    use_hub_routes: bool,
+    fallback_agent: Option<String>,
 }
 fn yes() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Route {
     chat: String,
@@ -50,6 +54,18 @@ struct Delivery {
     target: String,
     text: String,
     phase: String,
+    #[serde(default)]
+    chat: Option<String>,
+    #[serde(default)]
+    fallback: bool,
+}
+
+struct Forwarded {
+    event: String,
+    target: String,
+    text: String,
+    chat: String,
+    fallback: bool,
 }
 
 fn load(path: &Path) -> Result<Config> {
@@ -60,8 +76,13 @@ fn load(path: &Path) -> Result<Config> {
     config.sender_token_file = hub::relative_to(path, config.sender_token_file);
     config.state_file = hub::relative_to(path, config.state_file);
     let mut chats = HashSet::new();
-    if config.routes.is_empty() || config.routes.len() > 256 {
-        return Err("feishu-watch needs 1..256 routes".into());
+    if (!config.use_hub_routes && config.routes.is_empty() && config.fallback_agent.is_none())
+        || config.routes.len() > 256
+    {
+        return Err("feishu-watch needs static routes, hub routes or a fallback agent".into());
+    }
+    if let Some(agent) = &config.fallback_agent {
+        hub::qualified(agent)?;
     }
     for route in &config.routes {
         if !route.chat.starts_with("oc_")
@@ -78,7 +99,7 @@ fn load(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-fn message(line: &Value, routes: &[Route]) -> Result<Option<(String, String, String)>> {
+fn message(line: &Value, routes: &[Route], fallback: Option<&str>) -> Result<Option<Forwarded>> {
     if line["kind"] != "im.message.receive_v1" {
         return Ok(None);
     }
@@ -87,7 +108,18 @@ fn message(line: &Value, routes: &[Route]) -> Result<Option<(String, String, Str
         return Ok(None);
     }
     let msg = &event["message"];
-    let Some(route) = routes.iter().find(|r| msg["chat_id"] == r.chat) else {
+    if msg["chat_type"] == "p2p" {
+        return Ok(None);
+    }
+    let chat = msg["chat_id"]
+        .as_str()
+        .ok_or("Feishu message lacks chat id")?;
+    crate::chat_routes::validate_chat(chat)?;
+    let registered = routes
+        .iter()
+        .find(|r| chat == r.chat)
+        .map(|r| r.to.as_str());
+    let Some(target) = registered.or(fallback) else {
         return Ok(None);
     };
     let id = msg["message_id"]
@@ -108,15 +140,21 @@ fn message(line: &Value, routes: &[Route]) -> Result<Option<(String, String, Str
     // Sender identity and authority are checked by the receiver with get_message.
     let text = format!(
         "Feishu chat: {}\nfeishu-message: {id}\nMessage type: {}\n\n{body}\n\n[Forwarded by a sender-only service. Do not reply to this relay name. Reply in the source chat when appropriate. If your current context lacks the owner's ID, read your own global instruction file. {}]",
-        route.chat,
+        chat,
         msg["message_type"].as_str().unwrap_or("unknown"),
         crate::claude::FEISHU_RULE
     );
-    crate::validate_message(&route.to, "feishubot", &text)?;
-    Ok(Some((id.to_owned(), route.to.clone(), text)))
+    crate::validate_message(target, "feishubot", &text)?;
+    Ok(Some(Forwarded {
+        event: id.to_owned(),
+        target: target.to_owned(),
+        text,
+        chat: chat.to_owned(),
+        fallback: registered.is_none(),
+    }))
 }
 
-fn ingest(config: &Config, data: &mut Snapshot) -> Result<()> {
+fn ingest(config: &Config, routes: &[Route], data: &mut Snapshot) -> Result<()> {
     let file = File::open(&config.events_file)?;
     let meta = file.metadata()?;
     if data.device != meta.dev() || data.inode != meta.ino() || data.offset > meta.len() {
@@ -144,17 +182,23 @@ fn ingest(config: &Config, data: &mut Snapshot) -> Result<()> {
         }
         let line: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid Feishu event JSON; cursor retained")?;
-        if let Some((event, target, text)) = message(&line, &config.routes)?
-            && !data.seen.contains(&event)
+        if let Some(item) = message(&line, routes, config.fallback_agent.as_deref())?
+            && !data.seen.contains(&item.event)
+            && !data
+                .pending
+                .iter()
+                .any(|pending| pending.event == item.event)
         {
             data.pending.push(Delivery {
                 id: state::id()?,
-                event: event.clone(),
-                target,
-                text,
+                event: item.event.clone(),
+                target: item.target,
+                text: item.text,
                 phase: "queued".into(),
+                chat: Some(item.chat),
+                fallback: item.fallback,
             });
-            data.seen.push_back(event);
+            data.seen.push_back(item.event);
             if data.seen.len() > 4096 {
                 data.seen.pop_front();
             }
@@ -162,6 +206,72 @@ fn ingest(config: &Config, data: &mut Snapshot) -> Result<()> {
         data.offset += bytes.len() as u64;
     }
     state::write_json(&config.state_file, data)
+}
+
+fn routes(config: &Config, token: &Token) -> Result<Vec<Route>> {
+    let mut routes = Vec::new();
+    let mut chats = HashSet::new();
+    if config.use_hub_routes {
+        let mut cursor = None;
+        let mut revision = None;
+        loop {
+            let (code, body) = http::post_response(
+                &config.relay,
+                "/chats/list",
+                token,
+                &json!({"cursor":cursor}).to_string(),
+            )?;
+            if code != 200 {
+                return Err("hub chat routes unavailable; source cursor retained".into());
+            }
+            let page: Value = serde_json::from_str(&body)?;
+            let current = page["revision"]
+                .as_u64()
+                .ok_or("invalid chat route revision")?;
+            if revision.is_some_and(|previous| previous != current) {
+                return Err("chat routes changed during pagination; source cursor retained".into());
+            }
+            revision = Some(current);
+            for row in page["routes"].as_array().ok_or("invalid chat route page")? {
+                let chat = row["chat"].as_str().ok_or("chat route lacks chat")?;
+                let agent = row["agent"].as_str().ok_or("chat route lacks agent")?;
+                crate::chat_routes::validate_chat(chat)?;
+                hub::qualified(agent)?;
+                if !chats.insert(chat.to_owned()) || chats.len() > 4096 {
+                    return Err("invalid chat route table".into());
+                }
+                routes.push(Route {
+                    chat: chat.to_owned(),
+                    to: agent.to_owned(),
+                });
+            }
+            match page["nextCursor"].as_u64() {
+                None if page["nextCursor"].is_null() => break,
+                Some(next) if cursor.is_none_or(|previous| next > previous) => cursor = Some(next),
+                _ => return Err("invalid chat route cursor".into()),
+            }
+        }
+    }
+    for route in &config.routes {
+        if chats.insert(route.chat.clone()) {
+            routes.push(route.clone());
+        }
+    }
+    Ok(routes)
+}
+
+fn reroute_fallback(data: &mut Snapshot, routes: &[Route]) {
+    for item in &mut data.pending {
+        if item.phase == "queued"
+            && item.fallback
+            && let Some(route) = routes
+                .iter()
+                .find(|r| Some(r.chat.as_str()) == item.chat.as_deref())
+        {
+            item.target = route.to.clone();
+            item.fallback = false;
+        }
+    }
 }
 
 fn online(config: &Config, token: &Token) -> Result<HashSet<String>> {
@@ -286,7 +396,20 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         data.pending.len()
     );
     loop {
-        ingest(&config, &mut data)?;
+        match routes(&config, &token) {
+            Ok(routes) => {
+                reroute_fallback(&mut data, &routes);
+                ingest(&config, &routes, &mut data)?;
+            }
+            Err(error) => {
+                if once {
+                    return Err(error);
+                }
+                eprintln!("agent-inbox: Feishu route lookup unavailable; source cursor retained");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        }
         if let Err(error) = deliver(&config, &token, &mut data) {
             if once {
                 return Err(error);
@@ -318,6 +441,8 @@ mod tests {
         reachable: Arc<AtomicBool>,
         status: Arc<AtomicU16>,
         messages: Arc<Mutex<Vec<String>>>,
+        chat_routes: Arc<Mutex<Vec<Value>>>,
+        route_status: Arc<AtomicU16>,
         server: Option<std::thread::JoinHandle<()>>,
     }
     impl Fixture {
@@ -341,6 +466,10 @@ mod tests {
             let reachable = Arc::new(AtomicBool::new(true));
             let status = Arc::new(AtomicU16::new(202));
             let messages = Arc::new(Mutex::new(Vec::new()));
+            let chat_routes = Arc::new(Mutex::new(Vec::new()));
+            let table = chat_routes.clone();
+            let route_status = Arc::new(AtomicU16::new(200));
+            let route_code = route_status.clone();
             let (r, online, code, capture) = (
                 running.clone(),
                 reachable.clone(),
@@ -353,6 +482,9 @@ mod tests {
                 Arc::new(move |path, text, _, _| {
                     if path == "/directory/list" {
                         http::Response::json(200, json!({"agents":[{"name":"laptop.agent","host_online":true,"inbox_reachable":online.load(Ordering::Relaxed)}],"nextCursor":null}))
+                    } else if path == "/chats/list" {
+                        if route_code.load(Ordering::Relaxed)!=200 {return http::Response::new(503,"unavailable");}
+                        http::Response::json(200,json!({"routes":*table.lock().unwrap(),"nextCursor":null,"revision":1}))
                     } else {
                         assert_eq!(path, "/to/laptop.agent");
                         capture.lock().unwrap().push(text.to_owned());
@@ -369,6 +501,8 @@ mod tests {
                 reachable,
                 status,
                 messages,
+                chat_routes,
+                route_status,
                 server: Some(server),
             }
         }
@@ -390,6 +524,16 @@ mod tests {
         }
         fn state(&self) -> Snapshot {
             state::read_json(&self.config.state_file).unwrap()
+        }
+        fn hub_routes(&self, fallback: &str) {
+            let path = self.root.join("watch.toml");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let base = text.split("[[routes]]").next().unwrap();
+            std::fs::write(
+                path,
+                format!("{base}use_hub_routes=true\nfallback_agent='{fallback}'\n"),
+            )
+            .unwrap();
         }
     }
     impl Drop for Fixture {
@@ -471,5 +615,47 @@ mod tests {
         std::fs::write(path, config).unwrap();
         f.once(&[]);
         assert_eq!(f.messages.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_chat_queues_to_fallback_then_self_registration_reroutes_unsent_message() {
+        let f = Fixture::new();
+        f.hub_routes("laptop.fallback");
+        f.append(&event("om_unknown", "user", "oc_new"));
+        let mut private = event("om_private", "user", "oc_private");
+        private["event"]["event"]["message"]["chat_type"] = json!("p2p");
+        f.append(&private);
+        f.once(&[]);
+        assert_eq!(f.state().pending.len(), 1);
+        assert_eq!(f.state().pending[0].target, "laptop.fallback");
+        *f.chat_routes.lock().unwrap() = vec![json!({"chat":"oc_new","agent":"laptop.agent"})];
+        f.once(&[]);
+        assert_eq!(f.messages.lock().unwrap().len(), 1);
+        assert!(f.state().pending.is_empty());
+    }
+
+    #[test]
+    fn registered_offline_owner_never_falls_back_and_failed_lookup_does_not_advance_cursor() {
+        let f = Fixture::new();
+        f.hub_routes("laptop.agent");
+        *f.chat_routes.lock().unwrap() = vec![json!({"chat":"oc_new","agent":"laptop.absent"})];
+        f.append(&event("om_registered", "user", "oc_new"));
+        f.once(&[]);
+        assert_eq!(f.state().pending[0].target, "laptop.absent");
+        assert!(f.messages.lock().unwrap().is_empty());
+        let offset = f.state().offset;
+        f.append(&event("om_later", "user", "oc_later"));
+        f.route_status.store(503, Ordering::Relaxed);
+        assert!(
+            run(vec![
+                "--config".into(),
+                f.root.join("watch.toml").display().to_string(),
+                "--once".into()
+            ]
+            .into_iter())
+            .is_err()
+        );
+        assert_eq!(f.state().offset, offset);
+        assert_eq!(f.state().pending.len(), 1);
     }
 }

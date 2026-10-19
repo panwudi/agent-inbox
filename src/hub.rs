@@ -22,6 +22,7 @@ struct Config {
     journal: Option<PathBuf>,
     directory_file: Option<PathBuf>,
     directory_ttl_secs: Option<u64>,
+    chat_routes_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +63,7 @@ pub struct Router {
     hosts: HashMap<String, Peer>,
     log: PathBuf,
     directory: crate::directory::Directory,
+    chat_routes: crate::chat_routes::Routes,
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -223,6 +225,12 @@ impl Router {
                     path.with_extension("directory.json")
                 }
             });
+        let chat_routes = crate::chat_routes::Routes::open(
+            config
+                .chat_routes_file
+                .map(|p| relative_to(path, p))
+                .unwrap_or_else(|| directory_path.with_extension("chat-routes.json")),
+        )?;
         let directory = crate::directory::Directory::open(
             directory_path,
             &hosts.keys().cloned().collect(),
@@ -234,6 +242,7 @@ impl Router {
             hosts,
             log,
             directory,
+            chat_routes,
         })
     }
 
@@ -349,6 +358,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
                 Ok(page) => http::Response::json(200, page),
                 Err(_) => http::Response::new(400, "invalid directory query"),
             },
+            Some(sender) if path.starts_with("/chats/") => {
+                router.chat_routes.handle(path, sender, text)
+            }
             Some(sender) => router.forward(path, text, sender),
             None => http::Response::new(401, "bad token"),
         },

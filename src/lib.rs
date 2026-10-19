@@ -1,3 +1,4 @@
+pub mod chat_routes;
 pub mod claude;
 #[cfg(unix)]
 pub mod claude_join;

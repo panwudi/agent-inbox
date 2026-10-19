@@ -212,6 +212,15 @@ launchd/systemd 服务, 状态含义, agent 实时重载以及迁移.
 不会再建立第二条飞书监听连接. 接收方执行业主指令前, 必须自行回查原消息;
 不能根据群名或转发文字认定谁是业主.
 
+每个 agent 建好汇报群后, 用自己的身份登记:
+`agent-inbox chat-route register --chat <chat-id> --hub <local-relay> --token-file <own-sender-token>`.
+hub 根据已认证的发送者绑定收件人并保存, 拒绝别的 agent 覆盖已有登记.
+`chat-route list` 用于核对结果, `chat-route remove` 只能移除自己的登记.
+Claude 的 profile 和 Codex 当前会话状态都包含登记命令.
+启用 `use_hub_routes = true` 后, 转发程序会实时读取这些登记.
+没有登记的群消息交给 `fallback_agent`; 已登记的 agent 离线时仍为它保留消息.
+私聊和机器人消息不转发.
+
 转发前会保存读取位置和待发消息. agent 离线时, 消息留在队列里等待.
 重启和近期的重复事件不会重发已被接收的消息. 如果投递结果不确定,
 先人工核对, 再用 `--retry <delivery-id>` 重试. 第一次启动跳过旧记录,

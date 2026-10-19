@@ -222,6 +222,16 @@ It uses the bot's existing connection. It never opens a second Feishu listener.
 The receiver checks the cited original message before acting on an owner's
 instruction. No owner identity is inferred from a group name or message text.
 
+After creating a reporting chat, each agent registers it with
+`agent-inbox chat-route register --chat <chat-id> --hub <local-relay> --token-file <own-sender-token>`.
+The hub binds the chat to the authenticated agent, persists the mapping, and
+rejects another agent's attempt to overwrite it. `chat-route list` confirms the
+result; `chat-route remove` removes the caller's own mapping. Claude's profile
+and Codex's current session status include a registration command.
+With `use_hub_routes = true`, the watcher loads these registrations dynamically.
+`fallback_agent` receives unregistered group messages; a registered agent that
+is offline keeps its messages queued. Private chats and bot messages are ignored.
+
 The watcher saves its cursor and pending deliveries before forwarding. Offline
 agents keep their messages queued. Restarts and recent duplicate events do not
 repeat accepted messages. A lost acknowledgement stays unconfirmed for manual

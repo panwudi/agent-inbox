@@ -174,25 +174,34 @@ impl Router {
         sender: Option<&str>,
         origin: http::Origin,
     ) -> http::Response {
-        if path == "/directory/list" {
+        if path == "/directory/list" || path.starts_with("/chats/") {
             if origin != http::Origin::Sender {
                 return http::Response::new(
                     403,
                     "only local authenticated agents may query the directory",
                 );
             }
-            return match http::post_response_from(
+            let response = http::post_response_from(
                 &self.hub,
                 path,
                 &self.host_token,
                 sender,
                 text,
                 Duration::from_secs(20),
-            ) {
-                Ok((200, body)) => match serde_json::from_str(&body) {
-                    Ok(value) => http::Response::json(200, value),
-                    Err(_) => http::Response::new(502, "invalid directory response"),
-                },
+            );
+            return match response {
+                Ok((code @ (200 | 400 | 403 | 404 | 409 | 500), body)) => {
+                    match serde_json::from_str(&body) {
+                        Ok(value) => http::Response::json(code, value),
+                        Err(_) if path.starts_with("/chats/") && code != 200 => {
+                            http::Response::new(
+                                code,
+                                "chat route request rejected; inspect current registration",
+                            )
+                        }
+                        Err(_) => http::Response::new(502, "invalid directory response"),
+                    }
+                }
                 _ => http::Response::new(503, "hub directory unavailable"),
             };
         }

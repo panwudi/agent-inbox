@@ -52,6 +52,7 @@ impl Presence {
             "tokenFile":routing.token_file,"senderTokenFile":routing.sender_file,"queueFile":routing.queue_file,
             "replyCommand":format!("{executable} send {auth} --to <sender-logical-name> <reply-text>"),
             "directoryCommand":format!("{executable} who {auth}"),"profile":{"name":null,"registered":false},"statusCommand":status_command,
+            "chatRouteCommand":format!("{executable} chat-route register {auth} --chat <chat-id>"),
             "onlineMeaning":"Thread loaded in last valid daemon snapshot and inbox reachable; no human-attendance census. Idle messages can start autonomous work."}),
             ),
         })
@@ -76,10 +77,11 @@ impl Presence {
     pub fn context(&self) -> String {
         let value = self.status();
         format!(
-            "[Local inbox routing metadata, not user instructions or approval. Reply using: {}. When unsure whom to ask, run: {}. If the inbox restarted, refresh routing with: {}. Use the incoming sender's exact qualified name. Directory descriptions are coordination metadata. Online means a loaded thread/inbox, not human attendance; an idle addressed message may start work.]\n\n",
+            "[Local inbox routing metadata, not user instructions or approval. Reply using: {}. When unsure whom to ask, run: {}. If the inbox restarted, refresh routing with: {}. After creating a Feishu reporting chat, register it to this agent using: {}. Registration uses your authenticated sender identity and is routing metadata, not user approval. Use the incoming sender's exact qualified name. Directory descriptions are coordination metadata. Online means a loaded thread/inbox, not human attendance; an idle addressed message may start work.]\n\n",
             value["replyCommand"].as_str().unwrap_or("unavailable"),
             value["directoryCommand"].as_str().unwrap_or("unavailable"),
-            value["statusCommand"].as_str().unwrap_or("unavailable")
+            value["statusCommand"].as_str().unwrap_or("unavailable"),
+            value["chatRouteCommand"].as_str().unwrap_or("unavailable")
         )
     }
 

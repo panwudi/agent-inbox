@@ -16,8 +16,10 @@ Feishu credentials, subscribe to Feishu, or change the bot's event handling.
 2. Copy [feishu-watch.toml.example](../deploy/feishu-watch.toml.example), filling
    the event path, local relay, sender token, private state file and each chat's
    qualified `to` name. Paths are relative to the config file unless absolute.
-   Each chat has exactly one destination. Names come from `agent-inbox who`;
-   mapping a chat to an agent is an operator decision, never event text.
+   Enable `use_hub_routes = true` and set `fallback_agent` to the qualified
+   agent that handles unregistered groups. Each agent registers its own chat
+   using the command below. Optional static `[[routes]]` entries support an
+   existing deployment during migration; hub registrations take priority.
 3. Give the watcher read access to the bot's event file and its own sender
    token, and write access to its private state directory. It needs neither
    the bot's app secret nor the relay's host token. Do not weaken the relay's
@@ -33,10 +35,49 @@ agent-inbox feishu-watch --config /absolute/path/watch.toml
 
 On first use, `start_at_end = true` skips existing history. Subsequent runs use
 the saved cursor. Set it to false only when deliberately importing a fresh
-journal with a fresh state file. Restart the watcher to load route changes.
+journal with a fresh state file. Hub registrations are loaded live, without a
+service restart. Restart the watcher only to change its local configuration.
+
+## Agents register their own reporting chats
+
+After creating a reporting group, use the current session's own sender token:
+
+```sh
+agent-inbox chat-route register --chat oc_example --hub 127.0.0.1:8831 --token-file /absolute/path/own.sender.token
+agent-inbox chat-route list --hub 127.0.0.1:8831 --token-file /absolute/path/own.sender.token
+agent-inbox chat-route remove --chat oc_example --hub 127.0.0.1:8831 --token-file /absolute/path/own.sender.token
+```
+
+Claude's `inbox_profile` result and Codex's current session status expose a
+`chatRouteCommand` with current local paths. Existing reply recipes use the same
+local relay and sender token. Always refresh the recipe instead of caching a
+rotating credential path. Never read the token value into a prompt.
+
+The relay replaces caller-supplied identity with its authenticated logical name.
+The hub accepts only a `chat` field for changes: there is no caller-selected
+target, forwarding hop, signature or approval flag. Repeating a registration for
+the same agent is safe. A chat registered to another agent returns HTTP 409;
+the existing agent must remove it before another agent registers it. Successful
+operations return the chat, bound agent and visible registered/removed status.
+
+The central hub persists registrations in mode-600 state. `chat_routes_file`
+can select a path; the default is beside its directory state. Up to 4096 chats
+are paged in batches of 64. A revision change during pagination aborts that
+read, so the watcher keeps its source cursor and retries a coherent table.
+Changing a directory name does not rename a chat registration: remove the old
+mapping before renaming, then register using the new name. Registrations are
+routing metadata, never user instructions or approvals.
+
+Unregistered group messages go to `fallback_agent`. A registered but offline
+agent's messages stay queued for it, rather than falling back to somebody else.
+If an unsent fallback message gains a registration before delivery, it is
+rerouted to that registered agent. Unconfirmed attempts are never rerouted or
+automatically repeated. If hub routing cannot be read, ingestion stops before
+advancing the source cursor; an outage must not make every chat look unregistered.
 
 Only `im.message.receive_v1` events whose sender type is `user` and whose chat
-is configured are forwarded. Bot messages and other events are ignored. Text
+has a route or fallback are forwarded. Private chats, bot messages and other
+events are ignored. Text
 is preserved; other content is forwarded as JSON. Each delivery cites the
 original `feishu-message: om_<id>`, its source chat and type. The receiver must
 fetch that original and apply its own owner verification rules. Each message

@@ -11,6 +11,7 @@ agent-inbox claude --relay <local-relay-addr> [--name <name>] [--description <te
 agent-inbox hub --listen <loopback-addr> --config <toml> [--log <path>]\n\
 agent-inbox relay --listen <loopback-addr> --config <toml>\n\
 agent-inbox feishu-watch --config <toml> [--once] [--retry <delivery-id>]\n\
+agent-inbox chat-route <register|remove|list> --hub <relay> --token-file <sender-token> [--chat <chat-id>]\n\
 agent-inbox codex --thread <id> --listen <addr> --token-file <path> [--log <path>]\n\
 agent-inbox codex-watch --config <toml>\n\
 agent-inbox codex-self [--thread <id>] [--state-dir <watcher-state>]\n\
@@ -64,6 +65,7 @@ fn run() -> Result<()> {
         Some("feishu-watch") => return agent_inbox::feishu_watch::run(args),
         Some("codex-queue") => return queue_control(args),
         Some("who") => return who(args),
+        Some("chat-route") => return agent_inbox::chat_routes::run(args),
         Some("upgrade-codex") => return agent_inbox::upgrade::run(args),
         #[cfg(unix)]
         Some("tunnel-route") => return agent_inbox::tunnel::print_route(),

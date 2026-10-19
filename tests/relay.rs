@@ -328,6 +328,91 @@ fn sender_only_agents_send_locally_and_across_hosts_without_becoming_inboxes() {
 }
 
 #[test]
+fn chat_registration_uses_relay_authenticated_identity_and_rejects_cross_host_spoofing() {
+    let temp = Temp::new();
+    let a = Inbox::new(&temp, "alice.in");
+    let b = Inbox::new(&temp, "bob.in");
+    let reserve = TcpListener::bind("127.0.0.1:0").unwrap();
+    let central = reserve.local_addr().unwrap().to_string();
+    let ar = Process::relay(
+        &temp,
+        &temp.relay_config("alpha", &central, &a.address),
+        "0",
+    );
+    let br = Process::relay(&temp, &temp.relay_config("beta", &central, &b.address), "0");
+    drop(reserve);
+    let hub = hub(&temp, &central, &ar.address, &br.address);
+    let body = r#"{"chat":"oc_team"}"#;
+    assert_eq!(
+        post(&ar.address, "/chats/register", ASEND, "beta.bob", body),
+        200
+    );
+    let (code, body) = http::post_response(
+        &br.address,
+        "/chats/list",
+        &Token::read(&temp.0.join("bob.send")).unwrap(),
+        "{}",
+    )
+    .unwrap();
+    assert_eq!(code, 200);
+    let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        page["routes"],
+        serde_json::json!([{"chat":"oc_team","agent":"alpha.alice"}])
+    );
+    assert_eq!(
+        post(
+            &br.address,
+            "/chats/register",
+            BSEND,
+            "alpha.alice",
+            r#"{"chat":"oc_team"}"#
+        ),
+        409
+    );
+    assert_eq!(
+        post(
+            &ar.address,
+            "/chats/register",
+            ASEND,
+            "",
+            r#"{"chat":"oc_fake","agent":"beta.bob"}"#
+        ),
+        400
+    );
+    assert_eq!(
+        post(
+            &ar.address,
+            "/chats/register",
+            AHOST,
+            "beta.bob",
+            r#"{"chat":"oc_inbound"}"#
+        ),
+        403
+    );
+    assert_eq!(
+        post(
+            &hub.address,
+            "/chats/register",
+            AHOST,
+            "beta.bob",
+            r#"{"chat":"oc_outside"}"#
+        ),
+        403
+    );
+    assert_eq!(
+        post(
+            &ar.address,
+            "/chats/remove",
+            ASEND,
+            "",
+            r#"{"chat":"oc_team"}"#
+        ),
+        200
+    );
+}
+
+#[test]
 fn same_host_short_circuit_and_inbound_trust_do_not_bounce_to_hub() {
     let temp = Temp::new();
     let a = Inbox::new(&temp, "alice.in");
