@@ -107,9 +107,10 @@ fn message(line: &Value, routes: &[Route]) -> Result<Option<(String, String, Str
         .unwrap_or_else(|| content.to_string());
     // Sender identity and authority are checked by the receiver with get_message.
     let text = format!(
-        "Feishu chat: {}\nfeishu-message: {id}\nMessage type: {}\n\n{body}\n\n[Forwarded by a sender-only service. Do not reply to this relay name. Check the original with feishubot get_message; reply in the source chat when appropriate.]",
+        "Feishu chat: {}\nfeishu-message: {id}\nMessage type: {}\n\n{body}\n\n[Forwarded by a sender-only service. Do not reply to this relay name. Reply in the source chat when appropriate. If your current context lacks the owner's ID, read your own global instruction file. {}]",
         route.chat,
-        msg["message_type"].as_str().unwrap_or("unknown")
+        msg["message_type"].as_str().unwrap_or("unknown"),
+        crate::claude::FEISHU_RULE
     );
     crate::validate_message(&route.to, "feishubot", &text)?;
     Ok(Some((id.to_owned(), route.to.clone(), text)))
@@ -418,6 +419,8 @@ mod tests {
         assert_eq!(text.len(), 1);
         assert!(text[0].contains("feishu-message: om_a\n"));
         assert!(text[0].contains("原文 unchanged\nsecond line"));
+        assert!(text[0].contains(crate::claude::FEISHU_RULE));
+        assert!(text[0].contains("read your own global instruction file"));
         drop(text);
         std::fs::rename(&f.config.events_file, f.root.join("old.jsonl")).unwrap();
         std::fs::write(&f.config.events_file, "").unwrap();

@@ -39,8 +39,11 @@ Only `im.message.receive_v1` events whose sender type is `user` and whose chat
 is configured are forwarded. Bot messages and other events are ignored. Text
 is preserved; other content is forwarded as JSON. Each delivery cites the
 original `feishu-message: om_<id>`, its source chat and type. The receiver must
-fetch that original and apply its own owner verification rules. The bridge
-does not turn other participants' messages or card clicks into owner approval.
+fetch that original and apply its own owner verification rules. Each message
+includes the complete verification rule, so older sessions can read their own
+global instructions if the pinned owner ID is not yet in their context. No
+owner ID is supplied by the bridge. The bridge does not turn other participants'
+messages or card clicks into owner approval.
 Replies belong in the source Feishu chat when authorized; the sender-only
 service has no reply inbox.
 
