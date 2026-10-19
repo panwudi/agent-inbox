@@ -286,6 +286,48 @@ fn cross_host_delivery_uses_host_tokens_and_preserves_qualified_sender() {
 }
 
 #[test]
+fn sender_only_agents_send_locally_and_across_hosts_without_becoming_inboxes() {
+    let temp = Temp::new();
+    let a = Inbox::new(&temp, "alice.in");
+    let b = Inbox::new(&temp, "bob.in");
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let central = reserved.local_addr().unwrap().to_string();
+    let config = temp.relay_config("alpha", &central, &a.address);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[[agents]]\nname='bridge'\ndescription='Forwards chat messages'\nsender_token_file='charlie.send'\n");
+    std::fs::write(&config, text).unwrap();
+    let ar = Process::relay(&temp, &config, "0");
+    let br = Process::relay(&temp, &temp.relay_config("beta", &central, &b.address), "0");
+    drop(reserved);
+    let _hub = hub(&temp, &central, &ar.address, &br.address);
+    assert_eq!(
+        post(&ar.address, "/to/alpha.alice", CSEND, "spoofed", "local"),
+        202
+    );
+    assert_eq!(a.message(), ("local".into(), "alpha.bridge".into()));
+    assert_eq!(
+        post(&ar.address, "/to/beta.bob", CSEND, "spoofed", "remote"),
+        202
+    );
+    assert_eq!(b.message(), ("remote".into(), "alpha.bridge".into()));
+    assert_eq!(
+        post(&ar.address, "/to/alpha.bridge", ASEND, "", "reply"),
+        405
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = directory_page(&ar.address, &temp.0.join("charlie.send"));
+        let rows = page["agents"].as_array().unwrap();
+        assert!(!rows.iter().any(|r| r["name"] == "alpha.bridge"));
+        if rows.iter().any(|r| r["name"] == "alpha.alice") {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn same_host_short_circuit_and_inbound_trust_do_not_bounce_to_hub() {
     let temp = Temp::new();
     let a = Inbox::new(&temp, "alice.in");

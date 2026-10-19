@@ -111,6 +111,12 @@ message content or inbox addresses. Queries require authentication and use
 bounded pages. `AGENT_INBOX_RELAY` and `AGENT_INBOX_TOKEN_FILE` can supply the
 local address/token-file defaults, so an agent can invoke `agent-inbox who`.
 
+A static service that only sends can omit both `inbox` and `token_file`, while
+keeping `name`, `description` and `sender_token_file`. Its authenticated name
+stays fixed and it can send or query the directory. It is excluded from inbox
+reports and receives HTTP 405 if addressed. Supplying just one of the inbox
+fields is invalid. See [Feishu forwarding](FEISHU-WATCH.md) for one use.
+
 ## Services
 
 Copy and fill [the launchd agent](../deploy/io.agent-inbox.relay.plist.example)

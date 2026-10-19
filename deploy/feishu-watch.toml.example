@@ -1,0 +1,11 @@
+# Follow the event file written by the existing Feishu bot on this host.
+events_file = '/absolute/path/to/feishu-bot/events.jsonl'
+relay = '127.0.0.1:8831'
+sender_token_file = '/absolute/path/to/feishubot.sender.token'
+state_file = '/absolute/path/to/private-state/feishu-watch.json'
+# The first start follows new events only. Restarts resume the durable cursor.
+start_at_end = true
+
+[[routes]]
+chat = 'oc_example'
+to = 'laptop1.my-project-claude'

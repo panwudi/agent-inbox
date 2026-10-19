@@ -37,15 +37,15 @@ struct Config {
 struct AgentConfig {
     name: String,
     description: String,
-    inbox: String,
-    token_file: PathBuf,
+    inbox: Option<String>,
+    token_file: Option<PathBuf>,
     sender_token_file: PathBuf,
 }
 #[derive(Clone)]
 struct Agent {
-    inbox: String,
+    inbox: Option<String>,
     description: String,
-    token: Token,
+    token: Option<Token>,
     sender: Token,
     session: Option<sessions::Session>,
 }
@@ -93,21 +93,31 @@ impl Router {
         for agent in &config.agents {
             hub::validate_component(&agent.name)?;
             crate::directory::description(&agent.description)?;
-            let inbox = hub::loopback_endpoint(&agent.inbox)?;
-            let token = Token::read(&hub::relative_to(path, agent.token_file.clone()))?;
+            let (inbox, token) = match (&agent.inbox, &agent.token_file) {
+                (Some(inbox), Some(token)) => (
+                    Some(hub::loopback_endpoint(inbox)?),
+                    Some(Token::read(&hub::relative_to(path, token.clone()))?),
+                ),
+                (None, None) => (None, None),
+                _ => return Err("relay inbox and token_file must be supplied together".into()),
+            };
             let sender = Token::read(&hub::relative_to(path, agent.sender_token_file.clone()))?;
             if agents.contains_key(&agent.name) {
                 return Err("duplicate relay agent name".into());
             }
-            if bool::from(sender.bytes().ct_eq(host_token.bytes()))
-                || bool::from(token.bytes().ct_eq(host_token.bytes()))
-                || bool::from(token.bytes().ct_eq(sender.bytes()))
-                || agents.values().any(|existing| {
-                    bool::from(existing.sender.bytes().ct_eq(sender.bytes()))
-                        || bool::from(existing.token.bytes().ct_eq(sender.bytes()))
-                        || bool::from(existing.sender.bytes().ct_eq(token.bytes()))
-                        || bool::from(existing.token.bytes().ct_eq(token.bytes()))
+            if std::iter::once(&sender)
+                .chain(token.iter())
+                .any(|candidate| {
+                    bool::from(candidate.bytes().ct_eq(host_token.bytes()))
+                        || agents.values().any(|existing| {
+                            std::iter::once(&existing.sender)
+                                .chain(existing.token.iter())
+                                .any(|other| bool::from(candidate.bytes().ct_eq(other.bytes())))
+                        })
                 })
+                || token
+                    .as_ref()
+                    .is_some_and(|token| bool::from(token.bytes().ct_eq(sender.bytes())))
             {
                 return Err(
                     "local sender tokens must be independent of the host and other senders".into(),
@@ -212,10 +222,13 @@ impl Router {
             let Some(agent) = self.agents.get(name).filter(|agent| agent.live()) else {
                 return http::Response::new(404, "unknown local agent; message saved");
             };
+            let (Some(inbox), Some(token)) = (&agent.inbox, &agent.token) else {
+                return http::Response::new(405, "sender-only agent has no inbox; message saved");
+            };
             http::post(
-                &agent.inbox,
+                inbox,
                 "/",
-                &agent.token,
+                token,
                 Some(sender),
                 text,
                 Duration::from_secs(5),
@@ -268,6 +281,7 @@ fn reports(router: &Router) -> Vec<crate::directory::Report> {
         .agents
         .iter()
         .filter(|(_, agent)| agent.live())
+        .filter(|(_, agent)| agent.inbox.is_some())
         .collect();
     let result = Mutex::new(Vec::new());
     let cursor = std::sync::atomic::AtomicUsize::new(0);
@@ -282,7 +296,7 @@ fn reports(router: &Router) -> Vec<crate::directory::Report> {
                     let row = crate::directory::Report {
                         name: format!("{}.{name}", router.host),
                         description: agent.description.clone(),
-                        online: reachable(&agent.inbox),
+                        online: reachable(agent.inbox.as_deref().unwrap()),
                     };
                     result.lock().unwrap().push(row);
                 }

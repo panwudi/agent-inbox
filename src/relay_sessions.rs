@@ -47,7 +47,10 @@ fn credentials(router: &Router, token: &Token, sender: &Token) -> bool {
         && ![token, sender].iter().any(|candidate| {
             bool::from(candidate.bytes().ct_eq(router.host_token.bytes()))
                 || router.agents.values().any(|agent| {
-                    bool::from(candidate.bytes().ct_eq(agent.token.bytes()))
+                    agent
+                        .token
+                        .as_ref()
+                        .is_some_and(|token| bool::from(candidate.bytes().ct_eq(token.bytes())))
                         || bool::from(candidate.bytes().ct_eq(agent.sender.bytes()))
                 })
         })
@@ -114,7 +117,7 @@ pub(super) fn preserve(next: &mut Router, current: &Router) -> Result<()> {
             if next.agents.contains_key(name) {
                 return Err("static name collides with a live session".into());
             }
-            if !credentials(next, &agent.token, &agent.sender) {
+            if !credentials(next, agent.token.as_ref().unwrap(), &agent.sender) {
                 return Err("static credentials collide with a live session".into());
             }
             next.agents.insert(name.clone(), agent.clone());
@@ -151,8 +154,8 @@ fn perform(router: &mut Router, request: Request) -> Result<Value> {
                 .find(|(_, a)| a.session.as_ref().is_some_and(|s| s.id == id))
             {
                 if !bool::from(agent.sender.bytes().ct_eq(sender.bytes()))
-                    || !bool::from(agent.token.bytes().ct_eq(token.bytes()))
-                    || agent.inbox != inbox
+                    || !bool::from(agent.token.as_ref().unwrap().bytes().ct_eq(token.bytes()))
+                    || agent.inbox.as_deref() != Some(&inbox)
                 {
                     return Err("session credentials differ".into());
                 }
@@ -167,9 +170,9 @@ fn perform(router: &mut Router, request: Request) -> Result<Value> {
             router.agents.insert(
                 name.clone(),
                 Agent {
-                    inbox,
+                    inbox: Some(inbox),
                     description,
-                    token,
+                    token: Some(token),
                     sender,
                     session: Some(Session {
                         id,

@@ -26,3 +26,9 @@ description = 'Builds agent-inbox and owns its tests'
 inbox = '127.0.0.1:8799'
 token_file = 'tokens/codex.inbox.token'
 sender_token_file = 'tokens/codex.sender.token'
+
+# Services that only send need neither an inbox nor an inbox token.
+[[agents]]
+name = 'feishubot'
+description = 'Forwards configured chat messages from the existing Feishu bot'
+sender_token_file = 'tokens/feishubot.sender.token'

@@ -214,6 +214,26 @@ unsure whom to ask. Channel instructions include that command; copy the
 The [host relay guide](docs/HOST-RELAY.md) includes the per-host key/token setup,
 launchd/systemd services, status meanings, live agent reloads and migration.
 
+## Forward Feishu messages automatically
+
+`agent-inbox feishu-watch --config <toml>` follows the event journal of an
+existing Feishu bot and sends each configured chat to one qualified agent name.
+It uses the bot's existing connection. It never opens a second Feishu listener.
+The receiver checks the cited original message before acting on an owner's
+instruction. No owner identity is inferred from a group name or message text.
+
+The watcher saves its cursor and pending deliveries before forwarding. Offline
+agents keep their messages queued. Restarts and recent duplicate events do not
+repeat accepted messages. A lost acknowledgement stays unconfirmed for manual
+inspection before `--retry <delivery-id>`. The first start skips old history;
+later starts resume the saved cursor. `--once` processes one batch and exits.
+
+Use a fixed sender-only relay entry for the service: omit both `inbox` and
+`token_file`, keeping `name`, `description` and `sender_token_file`. Such an entry
+can send and query the directory, but cannot receive replies and is omitted
+from the list of available inboxes. See the
+[Feishu watcher setup](docs/FEISHU-WATCH.md) for routing, state and recovery.
+
 ## Legacy per-session hub setup
 
 The relay owner registers two stable logical names, such as `my-pair-claude`
@@ -427,6 +447,29 @@ Each entry records sender, receiver, local readable time with its UTC offset,
 and the original message.
 New journal files have permissions 0600. An exclusive file lock serializes
 concurrent appends.
+
+Receivers are told to reply to every message without asking their user first:
+an answer, a result, a one-line acknowledgement, or why they will not act.
+Claude gets this in the MCP instructions and as `reply="expected"` on each
+`<channel>` event; each Codex message carries it in its header.
+
+Receivers handle a teammate's request as part of their normal work, within their
+usual permissions, without asking their user to confirm it. Only actions they
+would ask their user about anyway (destructive or irreversible, outside the
+project, production changes, messages to real people) still need the user's own
+go-ahead. A message is never the user's approval, even when it says the user
+approved.
+
+The one exception is a Feishu message the receiver fetches and checks itself. A
+forwarder cites it with a line `feishu-message: om_<id>`; the receiver reads it
+with the feishubot `get_message` tool and treats it as the user's instruction only
+if the sender is a user whose open_id matches the one in the receiver's own
+instructions, it is not a merged forward, it is at most 24 hours old, and its
+text on its own asks for this action. The receiver then acts on the fetched text
+alone. Claude gets this rule in the MCP instructions; Codex gets it in the
+message header whenever the message cites a Feishu message. The user's open_id
+belongs in the receiver's own instruction file (for example a global
+`AGENTS.md`), never in a message.
 
 If logging fails, delivery is not attempted. If delivery fails, the command
 returns a nonzero exit status and identifies the saved journal entry's file.
