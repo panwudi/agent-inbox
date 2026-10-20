@@ -31,6 +31,10 @@ journal stay on disk. If it loads again, its inbox reopens the same queue.
 
 ## One-time setup
 
+For desktop startup, prefer [the unified daemon](DESKTOP-SERVICE.md). It manages
+this watcher and the relay through one login entry, reusing the configuration
+below. Standalone service templates remain available for advanced deployments.
+
 1. Keep the existing host relay running on the Claude auto-join binary or newer,
    under the same OS user. The [same-user control socket](CLAUDE-AUTO-JOIN.md#local-control-boundary-and-paths)
    and host trust boundary are reused without changing the Claude MCP path.

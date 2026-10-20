@@ -10,6 +10,7 @@ const USAGE: &str = "agent-inbox claude --listen <addr> --token-file <path> [--l
 agent-inbox claude --relay <local-relay-addr> [--name <name>] [--description <text>]\n\
 agent-inbox hub --listen <loopback-addr> --config <toml> [--log <path>]\n\
 agent-inbox relay --listen <loopback-addr> --config <toml>\n\
+agent-inbox daemon --config <toml> [--check]\n\
 agent-inbox feishu-watch --config <toml> [--once] [--retry <delivery-id>]\n\
 agent-inbox chat-route <register|remove|list> --hub <relay> --token-file <sender-token> [--chat <chat-id>]\n\
 agent-inbox codex --thread <id> --listen <addr> --token-file <path> [--log <path>]\n\
@@ -61,6 +62,8 @@ fn run() -> Result<()> {
         Some("hub") => return hub::run(args),
         #[cfg(unix)]
         Some("relay") => return agent_inbox::relay::run(args),
+        #[cfg(unix)]
+        Some("daemon") => return agent_inbox::daemon::run(args),
         #[cfg(unix)]
         Some("feishu-watch") => return agent_inbox::feishu_watch::run(args),
         Some("codex-queue") => return queue_control(args),

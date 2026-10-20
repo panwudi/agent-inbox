@@ -27,6 +27,11 @@ Claude 会话的 [自动加入](docs/CLAUDE-AUTO-JOIN.md) 使用一个用户级�
 定时示例, 参见 [定时 Codex 升级](docs/CODEX-UPGRADES.md).
 relay 服务与受监管隧道的配置见 [deploy/README.md](deploy/README.md).
 
+桌面开机启动使用 [一个统一服务](docs/DESKTOP-SERVICE.md):
+`agent-inbox daemon --config <toml>` 统一管理 relay 和可选的 Codex watcher.
+一个启动项负责整体启动, 停止和重启, 保留现有会话队列和配置.
+`--check` 只检查配置, 不启动服务. 原有独立命令仍可使用.
+
 ## 构建与使用
 
 需要 Rust 1.95 或更高版本, 以及一个正在运行的 Codex app-server daemon.

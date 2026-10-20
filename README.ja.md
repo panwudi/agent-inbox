@@ -28,6 +28,11 @@ Codex では, [ユーザー単位の watcher](docs/CODEX-AUTO-JOIN.md) がロー
 [Codex の定期アップグレード](docs/CODEX-UPGRADES.md) を参照してください.
 relay サービスと監視付きトンネルのセットアップは [deploy/README.md](deploy/README.md) にあります.
 
+デスクトップの自動起動には [統合サービス](docs/DESKTOP-SERVICE.md) を使います:
+`agent-inbox daemon --config <toml>` が relay と任意の Codex watcher を管理します.
+起動項目 1 つでまとめて起動, 停止, 再起動し, 既存のセッションキューと設定を維持します.
+`--check` はサービスを起動せず設定だけを検証します. 従来の単独コマンドも引き続き使えます.
+
 ## ビルドと使い方
 
 Rust 1.95 以降と, 実行中の Codex app-server daemon が必要です.

@@ -13,6 +13,8 @@ pub mod codex_registry;
 #[cfg(unix)]
 pub mod codex_watch;
 pub mod command;
+#[cfg(unix)]
+pub mod daemon;
 pub mod directory;
 #[cfg(unix)]
 pub mod feishu_watch;

@@ -119,6 +119,10 @@ fields is invalid. See [Feishu forwarding](FEISHU-WATCH.md) for one use.
 
 ## Services
 
+For a desktop, prefer [one unified startup service](DESKTOP-SERVICE.md), which
+owns this relay and the optional Codex watcher. Use the standalone relay units
+below only when managing that component separately; do not start both forms.
+
 Copy and fill [the launchd agent](../deploy/io.agent-inbox.relay.plist.example)
 for macOS or [the systemd unit](../deploy/agent-inbox-relay.service) and
 [relay.env.example](../deploy/relay.env.example) for Linux. These restart the

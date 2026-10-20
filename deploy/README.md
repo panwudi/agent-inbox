@@ -7,6 +7,11 @@ The current topology uses [one host relay/tunnel](../docs/HOST-RELAY.md), with
 host-only central registration and a prefix-scoped agent directory. Per-session
 tunnel instructions below remain available for migration.
 
+For desktop startup, use [the unified desktop service](../docs/DESKTOP-SERVICE.md).
+It owns the relay and optional Codex watcher through one login entry. The
+standalone relay/watcher units below remain available for server and advanced
+deployments; do not install them alongside a daemon that owns those components.
+
 For [Claude auto-join](../docs/CLAUDE-AUTO-JOIN.md), ship the user-scope
 [MCP entry](claude-user-mcp.json.example) and the all-directory
 [shell wrapper](claude-with-inbox.bash) together. Both use the exact MCP name

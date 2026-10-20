@@ -31,6 +31,12 @@ window, verifies the new daemon, then releases FIFO queues. See
 updater, registering every inbox, reports, recovery and schedule examples.
 Relay service and supervised tunnel setup are in [deploy/README.md](deploy/README.md).
 
+For desktop startup, use [one unified service](docs/DESKTOP-SERVICE.md):
+`agent-inbox daemon --config <toml>` owns the relay and optional Codex watcher.
+One login entry starts, stops and restarts them together, while preserving
+existing session queues and configuration. `--check` validates the configuration
+without starting services. Standalone commands remain available.
+
 ## Build and use
 
 Requires Rust 1.95 or later and a running Codex app-server daemon.

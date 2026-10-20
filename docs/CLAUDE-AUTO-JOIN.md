@@ -9,6 +9,10 @@ token setup or port is needed. Codex joins through its separate
 
 ## One-time setup
 
+Use [one desktop startup service](DESKTOP-SERVICE.md) to manage the local relay
+and optional Codex watcher through one login entry. The Claude MCP entry and
+channel wrapper below remain the same.
+
 1. Upgrade the local host relay, running as the same OS user as Claude. Its
    existing host token/tunnel config still applies; `agents` can be empty. Restart
    it on the new binary. No central hub change is required for each new session.

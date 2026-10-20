@@ -311,7 +311,7 @@ impl Watcher {
         Ok(OwnedChild(Some(command.spawn()?)))
     }
 
-    fn run(&self) -> Result<()> {
+    fn run(&self, parent: Option<u32>) -> Result<()> {
         crate::local_control::private_dir(&self.root)?;
         crate::local_control::private_dir(&self.registry)?;
         let lock = state::open_private(&self.registry.join("codex-watch.lock"), true)?;
@@ -334,6 +334,7 @@ impl Watcher {
                 return Err("cannot install watcher shutdown handler".into());
             }
         }
+        crate::daemon::watch_parent(parent, &STOP)?;
         eprintln!(
             "agent-inbox: Codex watcher ready; online means daemon-loaded/inbox reachable, not human attendance"
         );
@@ -468,11 +469,24 @@ impl Drop for Slots {
     }
 }
 
+pub(crate) fn validate_for_daemon(path: &Path) -> Result<(String, Option<PathBuf>)> {
+    let watcher = Watcher::load(path)?;
+    Ok((watcher.relay, watcher.control))
+}
+
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut config = None;
+    let mut parent = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--config" => config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?)),
+            "--parent" => {
+                parent = Some(
+                    args.next()
+                        .ok_or("missing watcher parent")?
+                        .parse::<u32>()?,
+                )
+            }
             "--help" | "-h" => {
                 println!("agent-inbox codex-watch --config <toml>");
                 return Ok(());
@@ -480,7 +494,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
             _ => return Err("unknown codex-watch option".into()),
         }
     }
-    Watcher::load(&config.ok_or("codex-watch requires --config")?)?.run()
+    Watcher::load(&config.ok_or("codex-watch requires --config")?)?.run(parent)
 }
 
 pub fn own_status(mut args: impl Iterator<Item = String>) -> Result<()> {

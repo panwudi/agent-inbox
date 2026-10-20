@@ -454,11 +454,27 @@ impl Drop for Tunnel {
     }
 }
 
+pub(crate) fn validate_for_daemon(path: &Path, no_tunnel: bool) -> Result<Option<PathBuf>> {
+    let (_, config) = Router::load(path)?;
+    if !no_tunnel {
+        for file in [config.tunnel_script.as_ref(), config.tunnel_env.as_ref()] {
+            if !file.is_some_and(|p| hub::relative_to(path, p.clone()).is_file()) {
+                return Err(
+                    "desktop relay requires readable tunnel_script/tunnel_env or no_tunnel=true"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(config.control_socket.map(|p| hub::relative_to(path, p)))
+}
+
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut listen = None;
     let mut path = None;
     let mut state_dir = None;
     let mut no_tunnel = false;
+    let mut parent = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -468,6 +484,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
                 return Ok(());
             }
             "--no-tunnel" => no_tunnel = true,
+            "--parent" => parent = Some(args.next().ok_or("missing relay parent")?.parse::<u32>()?),
             "--listen" | "--config" | "--state-dir" => {
                 let value = args.next().ok_or("missing relay option value")?;
                 match arg.as_str() {
@@ -507,6 +524,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
+    crate::daemon::watch_parent(parent, &STOP)?;
     let _tunnel = if no_tunnel {
         None
     } else {
