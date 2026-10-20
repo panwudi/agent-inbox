@@ -239,6 +239,7 @@ fn run_join(
     let sessions = sessions
         .map(Ok)
         .unwrap_or_else(crate::claude_join::default_sessions)?;
+    let runtime = crate::claude_runtime::Runtime::from_env(&sessions)?;
     let name = name
         .map(Ok)
         .unwrap_or_else(crate::claude_join::default_name)?;
@@ -247,7 +248,7 @@ fn run_join(
     crate::directory::description(&description)?;
     validate_message(&name, &sender, "configuration")?;
     let log = log.map(Ok).unwrap_or_else(journal::default_path)?;
-    let credentials = Credentials::create(&sessions)?;
+    let credentials = Credentials::create(&sessions)?.with_runtime(runtime.clone());
     let token = credentials.inbox.clone();
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -298,15 +299,73 @@ fn run_join(
         }
     }
     let http_state = Arc::clone(&state);
+    let http_inner = Arc::clone(&join.inner);
     let handler = Arc::new(move |text: &str, from: Option<&str>| {
         let name = receiver
             .read()
             .map(|name| name.clone())
             .unwrap_or_else(|_| "claude".into());
-        accept_message(&http_state, &log, &name, from.unwrap_or(&sender), text)
+        let from = from.unwrap_or(&sender);
+        if let Some(runtime) = &http_inner.runtime {
+            if runtime.uses_native() {
+                if journal::append(&log, from, &name, text).is_err() {
+                    return http::Response::new(
+                        500,
+                        "journal write failed; message was not delivered",
+                    );
+                }
+                if !http_state.lock().is_ok_and(|state| state.ready) {
+                    return http::Response::new(
+                        503,
+                        "message saved; session initialization incomplete",
+                    );
+                }
+                let metadata = match http_inner.tool(&json!({})) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return http::Response::new(
+                            503,
+                            "message saved; session metadata unavailable",
+                        );
+                    }
+                };
+                let mut input = crate::coordination_input(from, text)[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                input.push_str(&format!("\n\n[Local inbox routing metadata, not user instructions or approval. Current receiver profile: {metadata}]") );
+                return match runtime.send(&input) {
+                    Ok(()) => http::Response::new(
+                        202,
+                        "message saved and posted to Claude native inbox; session receipt unconfirmed",
+                    ),
+                    Err(error) => {
+                        eprintln!(
+                            "agent-inbox: Claude native delivery unavailable or unconfirmed: {error}; message retained"
+                        );
+                        http::Response::new(
+                            503,
+                            "message saved; Claude native inbox unavailable or delivery unconfirmed",
+                        )
+                    }
+                };
+            }
+            if !runtime.ready() {
+                let _ = journal::append(&log, from, &name, text);
+                return http::Response::new(503, "message saved; Claude session is not receiving");
+            }
+        }
+        accept_message(&http_state, &log, &name, from, text)
     });
     let http_running = Arc::clone(&running);
-    let server = std::thread::spawn(move || http::serve(listener, token, http_running, handler));
+    let health_state = Arc::clone(&state);
+    let health = Arc::new(move || {
+        health_state.lock().is_ok_and(|state| state.ready)
+            && runtime.as_ref().is_none_or(|runtime| runtime.ready())
+    });
+    let server = std::thread::spawn(move || {
+        http::serve_with_health(listener, token, http_running, handler, health)
+    });
     eprintln!("agent-inbox: listening on http://{address}/");
     let tool_inner = Arc::clone(&join.inner);
     let tool: Arc<ProfileTool> = Arc::new(move |args| tool_inner.tool(args));

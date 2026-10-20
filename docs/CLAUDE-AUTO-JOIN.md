@@ -51,11 +51,21 @@ variadic channel option. Explicit additional development channels are preserved.
 The [Claude channel reference](https://code.claude.com/docs/en/channels-reference#test-it)
 documents the `server:<MCP-entry-name>` form.
 
-**Without the channel flag, the session still registers and journals received
-messages, but Claude Code silently drops the notifications. The journal is then
-the only message copy on the receiving side.** Registration/HTTP 200 does not
-prove the model saw a live event. The wrapper adds the channel flag; it does not
-bypass Claude's development-channel consent or organization policy.
+Modern Claude sessions export their own native inbox. Auto-join prefers that
+inbox, so a background worker does not lose messages merely because its launch
+omitted the development-channel flag. The receiver checks its parent PID,
+session ID, project, native protocol version and socket peer before using the
+parent's inherited token. It never discovers or reads another session's token.
+See [Claude's own-child socket contract](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket).
+Native inbound controls still apply. HTTP 202 means the message was journaled
+and written to that inbox; actual model receipt requires a reply. A failed or
+uncertain native write is not retried through the channel transport.
+
+Older sessions use the channel transport. A session with a Claude session ID
+but neither a native inbox nor the matching channel flag reports unavailable,
+rather than claiming live receipt. The wrapper remains useful for legacy
+versions; it does not bypass development-channel consent or organization policy.
+Explicit `claude --listen` inboxes retain their legacy channel behavior.
 
 ## Session behavior
 
@@ -71,13 +81,24 @@ bypass Claude's development-channel consent or organization policy.
   The default description is `Claude session in <name>`. The inbox does not
   infer a different cwd from environment variables or change directories.
 - Call the `inbox_profile` MCP tool with `{}` for the assigned name, description,
-  registration status and exact reply/directory commands. Set `name` and/or
+  registration status, `deliveryTransport`, `transportReady`, `continuedTo`, and
+  exact reply/directory commands. Set `name` and/or
   `description` to update this session. Names are one local component; duplicate
   names receive `-2`, `-3`, etc. Always use the returned qualified name.
 - Successful changes update routing and the hub directory promptly. The sender
   token stays fixed, so replies automatically use the new identity. Old names
   are removed. The tool accepts no target/session ID for changing another inbox.
-- The default heartbeat is 15 seconds and TTL 45 seconds. EOF, SIGINT, SIGTERM
+- An explicit Claude `continued-in` transcript record retires only that old
+  receiver's registration. Its successor inherits the old name and description
+  using private local continuation metadata, without sharing sender tokens.
+  The old receiver cannot rejoin or rename itself after retirement, including
+  after a relay restart. Existing chat routes retain the same qualified name.
+  Sharing a project directory alone never merges independent sessions or forks.
+  A complete matching record is required; partial records and unrelated copied
+  history do not transfer identity. An occupied successor name is not taken over.
+- The default legacy heartbeat is 15 seconds and TTL 45 seconds. Native session
+  lifecycle checks and heartbeats run at most one second apart, shortened for a
+  smaller TTL. EOF, SIGINT, SIGTERM
   or SIGHUP attempts a quick unregister and removes this session's token files.
   A killed process is TTL-evicted; expired sender credentials stop authorizing
   requests. The next inbox startup removes stale credential directories using
@@ -111,6 +132,11 @@ Per-session credentials live in private directories under
 parent for isolated setups. Tokens are 256-bit random values in mode-600 files;
 their values never appear in MCP output, journals, config, directory reports or
 diagnostics. Only the relay receives them over the authenticated local socket.
+The private `continuations` subdirectory retains names and observed continuation
+links across receiver reconnects; it contains no sender or native-inbox tokens.
+Receiver health requires MCP initialization and a usable selected transport;
+retired or unavailable receivers return HTTP 503 to health checks and are not
+reported online. An online transport still does not prove a model acted.
 
 A Linux system service running as a dedicated `agent-inbox` account cannot
 register sessions owned by a different user. Use a relay running as the session
@@ -137,4 +163,4 @@ thread/inbox, not that a human is watching a TUI. The daemon may retain a thread
 for up to 30 minutes after its last subscriber disconnects; daemon errors retain
 the watcher's last valid membership while messages queue. Addressing an idle
 Codex can start autonomous work without an attached human. Existing permissions
-and FIFO still apply. Claude's channel flag remains required for Claude events.
+and FIFO still apply. Legacy Claude channel receivers still require the channel flag.

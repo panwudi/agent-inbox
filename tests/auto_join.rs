@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
@@ -15,6 +15,49 @@ use agent_inbox::{http, local_control, state, token::Token};
 use serde_json::{Value, json};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const HOST_TOKEN: &str = "own-host-control-test-private-token-000000";
+const NATIVE_TOKEN: &str = "fake-claude-own-child-token-000000000";
+static FAKE_CLAUDE: OnceLock<PathBuf> = OnceLock::new();
+
+extern "C" fn cleanup_claude_fixture() {
+    if let Some(path) = FAKE_CLAUDE.get() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn fake_claude() -> PathBuf {
+    FAKE_CLAUDE
+        .get_or_init(|| {
+            let path = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(format!("fake-claude-{}", std::process::id()));
+            let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .arg("--edition=2024")
+                .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_claude.rs"))
+                .arg("-o")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                Command::new(&path)
+                    .arg("--version")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            unsafe {
+                libc::atexit(cleanup_claude_fixture);
+            }
+            path
+        })
+        .clone()
+}
 
 struct Temp(PathBuf);
 impl Temp {
@@ -206,13 +249,37 @@ impl Inbox {
         Self::start_named(setup, None)
     }
     fn start_named(setup: &Setup, name: Option<&str>) -> Self {
+        Self::start_options(setup, name, None)
+    }
+    fn start_options(
+        setup: &Setup,
+        name: Option<&str>,
+        runtime: Option<(&str, &std::path::Path, bool)>,
+    ) -> Self {
         let parent = setup.temp.0.join("sessions");
         let before: Vec<_> = std::fs::read_dir(&parent)
             .into_iter()
             .flatten()
             .map(|e| e.unwrap().path())
             .collect();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-inbox"));
+        let mut command = if let Some((id, root, native)) = runtime {
+            let mut command = Command::new(fake_claude());
+            command
+                .arg(env!("CARGO_BIN_EXE_agent-inbox"))
+                .env("AGENT_INBOX_FAKE_CLAUDE_ROOT", root)
+                .env("CLAUDE_CODE_SESSION_ID", id)
+                .env("CLAUDE_CONFIG_DIR", root)
+                .env("CLAUDE_PROJECT_DIR", setup.temp.0.join("sample-repo"))
+                .env("CLAUDE_CODE_MESSAGING_TOKEN", NATIVE_TOKEN);
+            if !native {
+                command.env("AGENT_INBOX_FAKE_DISABLE_NATIVE", "1");
+            }
+            command
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_agent-inbox"));
+            command.env_remove("CLAUDE_CODE_SESSION_ID");
+            command
+        };
         command
             .args([
                 "claude",
@@ -269,7 +336,14 @@ impl Inbox {
         let credentials = std::fs::read_dir(&parent)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .find(|p| p.is_dir() && !before.contains(p))
+            .find(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("session-")
+                    && !before.contains(p)
+            })
             .unwrap();
         let mut inbox = Self {
             child,
@@ -570,6 +644,184 @@ fn relay_down_does_not_block_mcp_and_journaled_inbox_joins_later() {
         std::fs::read_to_string(setup.temp.0.join("messages.md"))
             .unwrap()
             .contains("saved before relay starts")
+    );
+}
+
+fn native_root(setup: &Setup) -> PathBuf {
+    let root = setup.temp.0.join("claude");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn native_transcript(setup: &Setup, root: &std::path::Path, id: &str) -> PathBuf {
+    let project = setup.temp.0.join("sample-repo").canonicalize().unwrap();
+    let slug = project.to_string_lossy().replace('/', "-");
+    let path = root.join("projects").join(slug).join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if !path.exists() {
+        std::fs::write(&path, "").unwrap();
+    }
+    path
+}
+
+fn native_template(setup: &Setup, root: &std::path::Path, id: &str) {
+    std::fs::write(
+        root.join(format!("{id}.template")),
+        json!({
+            "pid":0,"sessionId":id,"cwd":setup.temp.0.join("sample-repo").canonicalize().unwrap(),
+            "kind":"bg","peerProtocol":1,"messagingSocketPath":root.join(format!("{id}.sock"))
+        })
+        .to_string(),
+    )
+    .unwrap();
+    native_transcript(setup, root, id);
+}
+
+#[test]
+fn native_inbox_receives_without_channel_flags_and_disconnected_socket_is_offline() {
+    let setup = Setup::new(true);
+    let root = native_root(&setup);
+    let id = state::id().unwrap();
+    native_template(&setup, &root, &id);
+    let mut inbox = Inbox::start_options(&setup, None, Some((&id, &root, true)));
+    assert_eq!(inbox.profile(json!({}))["deliveryTransport"], "native");
+    wait(|| setup.directory()["agents"][0]["inbox_reachable"] == true);
+    let status = setup.send(
+        "testhost.sample-repo-claude",
+        "native probe without channel flags",
+    );
+    assert_eq!(
+        status,
+        202,
+        "{}",
+        inbox
+            .errors
+            .lock()
+            .unwrap()
+            .replace(NATIVE_TOKEN, "<redacted>")
+    );
+    let capture = root.join(format!("{id}.capture"));
+    wait(|| std::fs::read_to_string(&capture).is_ok_and(|text| text.contains("native probe")));
+    let messages: Vec<Value> = std::fs::read_to_string(&capture)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 1);
+    let text = messages[0]["message"]["content"].as_str().unwrap();
+    assert!(text.contains("not the user's instruction or approval"));
+    assert!(text.contains("Current receiver profile:"));
+    assert!(text.contains("replyCommand"));
+    assert!(!inbox.output.lock().unwrap().contains("native probe"));
+    inbox.secret_free(&setup, &[NATIVE_TOKEN.to_owned()]);
+    std::fs::remove_file(root.join(format!("{id}.sock"))).unwrap();
+    wait(|| setup.directory()["agents"][0]["inbox_reachable"] == false);
+    assert_eq!(
+        setup.send(
+            "testhost.sample-repo-claude",
+            "must remain saved, not silently dropped"
+        ),
+        502
+    );
+    assert_eq!(
+        std::fs::read_to_string(&capture).unwrap().lines().count(),
+        1
+    );
+    assert!(
+        std::fs::read_to_string(setup.temp.0.join("messages.md"))
+            .unwrap()
+            .contains("must remain saved")
+    );
+}
+
+#[test]
+fn missing_native_inbox_and_channel_flags_never_advertises_receiving() {
+    let setup = Setup::new(true);
+    let root = native_root(&setup);
+    let id = state::id().unwrap();
+    native_template(&setup, &root, &id);
+    let mut inbox = Inbox::start_options(&setup, None, Some((&id, &root, false)));
+    assert_eq!(inbox.profile(json!({}))["deliveryTransport"], "unavailable");
+    wait(|| setup.contains("testhost.sample-repo-claude"));
+    assert_eq!(setup.directory()["agents"][0]["inbox_reachable"], false);
+    assert_eq!(
+        setup.send(
+            "testhost.sample-repo-claude",
+            "must not claim channel delivery"
+        ),
+        502
+    );
+    assert!(
+        !inbox
+            .output
+            .lock()
+            .unwrap()
+            .contains("must not claim channel delivery")
+    );
+}
+
+#[test]
+fn explicit_continuation_transfers_custom_name_but_independent_sessions_stay_separate() {
+    let mut setup = Setup::new(true);
+    let root = native_root(&setup);
+    let source = state::id().unwrap();
+    let successor = state::id().unwrap();
+    let independent = state::id().unwrap();
+    for id in [&source, &successor, &independent] {
+        native_template(&setup, &root, id);
+    }
+    let mut first =
+        Inbox::start_options(&setup, Some("custom-owner"), Some((&source, &root, true)));
+    first.profile(json!({"description":"Owns the continued work"}));
+    let mut second = Inbox::start_options(&setup, None, Some((&successor, &root, true)));
+    let mut third = Inbox::start_options(&setup, None, Some((&independent, &root, true)));
+    let independent_name = third.profile(json!({}))["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait(|| setup.directory()["agents"].as_array().unwrap().len() == 3);
+    let source_file = native_transcript(&setup, &root, &source);
+    let record = json!({"type":"continued-in","sessionId":source,"continuedInSessionId":successor})
+        .to_string();
+    std::fs::write(&source_file, &record).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        first.profile(json!({}))["registered"],
+        true,
+        "partial record must not retire a live session"
+    );
+    std::fs::write(&source_file, format!("{record}\n")).unwrap();
+    wait(|| first.profile(json!({}))["registered"] == false);
+    assert_eq!(first.profile(json!({}))["continuedTo"], successor);
+    wait(|| second.profile(json!({}))["name"] == "testhost.custom-owner");
+    assert_eq!(
+        second.profile(json!({}))["description"],
+        "Owns the continued work"
+    );
+    assert_eq!(third.profile(json!({}))["name"], independent_name);
+    wait(|| setup.directory()["agents"].as_array().unwrap().len() == 2);
+    assert_eq!(
+        setup.send("testhost.custom-owner", "after explicit continuation"),
+        202
+    );
+    wait(|| {
+        std::fs::read_to_string(root.join(format!("{successor}.capture")))
+            .is_ok_and(|t| t.contains("after explicit continuation"))
+    });
+    assert!(!root.join(format!("{source}.capture")).exists());
+    drop(setup.relay.take());
+    setup.start();
+    wait(|| second.profile(json!({}))["registered"] == true);
+    assert_eq!(first.profile(json!({}))["registered"], false);
+    assert_eq!(second.profile(json!({}))["name"], "testhost.custom-owner");
+    assert_eq!(third.profile(json!({}))["name"], independent_name);
+    wait(|| setup.directory()["agents"].as_array().unwrap().len() == 2);
+    assert_eq!(
+        first.rpc(
+            "tools/call",
+            json!({"name":"inbox_profile","arguments":{"name":"should-not-return"}})
+        )["result"]["isError"],
+        true
     );
 }
 

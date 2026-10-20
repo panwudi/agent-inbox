@@ -18,6 +18,10 @@
 Claude 会话的 [自动加入](docs/CLAUDE-AUTO-JOIN.md) 使用一个用户级的 `agent-inbox-join` MCP 条目,
 以及一个对所有目录生效的 channel 包装脚本. 每个会话获得一个临时 inbox, 私有凭据和一个目录名;
 `inbox_profile` 读取或更新它自己的名字/描述. 无需手工添加会话条目.
+新版 Claude 会话优先使用自己的原生收件口, 后台会话即使漏带 channel 启动参数也能收信.
+有明确续接记录时, 旧登记退出, 新会话保留原名字; 独立会话仍各自保留.
+收件口不可用时不再显示在线. 旧 channel 收件方式仍需匹配的启动参数.
+传输检查细节见自动加入说明.
 
 对于 Codex, [按用户运行的 watcher](docs/CODEX-AUTO-JOIN.md) 为每个已加载的精确 thread ID 注册一个 inbox,
 名字取自 thread 的 cwd. 在线并不表示有人在看; 发给空闲 Codex 的消息可能会启动自主工作.
@@ -154,7 +158,7 @@ hub 回复同时使用 `--hub` 和 `--hub-token-file`, 而不是
 | 状态码 | 含义 |
 | --- | --- |
 | 200 | 消息已记录且 Claude notification 已写出, 或输入已被 Codex 接受. |
-| 202 | 消息已记录, 并排队等待 MCP 初始化完成. |
+| 202 | 消息已记录并等待初始化, 或已写入 Claude 原生收件口. |
 | 400 | 请求为空, 超长, 被截断或分帧错误. |
 | 401 | bearer token 缺失或错误. |
 | 431 | 请求头超过 16 KiB. |
@@ -167,8 +171,8 @@ authorization 或 length 头以及 transfer encoding 都会被拒绝. 读取
 channel 初始化之前, 最多 64 条消息在内存中等待; 超出的
 经鉴权消息会保存到 journal 并返回 503.
 
-HTTP 200 确认 notification 已写出, 而不是 Claude 已处理它.
-channel 协议没有回执确认. `send` 会显示已接受或待处理的反馈,
+HTTP 200/202 确认传输层已接受, 而不是 Claude 已处理消息.
+需要实际收信确认时请让对方回复. `send` 会显示已接受或待处理的反馈,
 被拒绝时返回非零状态.
 
 ## Codex HTTP inbox 配置

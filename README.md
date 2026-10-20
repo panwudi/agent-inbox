@@ -20,6 +20,11 @@ For Claude sessions, [automatic joining](docs/CLAUDE-AUTO-JOIN.md) uses one
 user-scoped `agent-inbox-join` MCP entry and an all-directory channel wrapper.
 Each session gets an ephemeral inbox, private credentials and a directory name;
 `inbox_profile` reads or updates its own name/description. No manual session row.
+Modern Claude sessions receive through their own native inbox, including in
+the background without a channel launch flag. Explicit continuations retire
+the old registration and retain its name; independent sessions stay separate.
+Unavailable receivers are not advertised online. Legacy channel inboxes still
+need the matching channel flag. See the auto-join guide for transport checks.
 
 For Codex, [the per-user watcher](docs/CODEX-AUTO-JOIN.md) registers one inbox per
 exact loaded thread ID, with names from thread cwd. Online does not imply a
@@ -163,7 +168,7 @@ file and use the incoming `from` attribute as the reply's logical destination.
 | Status | Meaning |
 | --- | --- |
 | 200 | Message logged and Claude notification written, or input accepted by Codex. |
-| 202 | Message logged and queued until MCP initialization completes. |
+| 202 | Message logged and queued for initialization, or posted to Claude's native inbox. |
 | 400 | Empty, oversized, truncated, or incorrectly framed request. |
 | 401 | Missing or incorrect bearer token. |
 | 431 | Request headers exceed 16 KiB. |
@@ -176,8 +181,8 @@ each request has a five-second deadline, and at most 16 requests run at once.
 Before channel initialization, up to 64 messages wait in memory; additional
 authenticated messages are saved to the journal and return 503.
 
-HTTP 200 confirms the notification was written, not that Claude has processed
-it. The channel protocol has no receipt acknowledgment. `send` shows accepted
+HTTP 200/202 confirms transport acceptance, not that Claude has processed
+the message. Ask for a reply to verify actual receipt. `send` shows accepted
 or pending feedback and returns a nonzero status on rejection.
 
 ## Codex HTTP inbox setup

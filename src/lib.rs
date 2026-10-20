@@ -2,6 +2,8 @@ pub mod chat_routes;
 pub mod claude;
 #[cfg(unix)]
 pub mod claude_join;
+#[cfg(unix)]
+pub mod claude_runtime;
 pub mod codex;
 #[cfg(unix)]
 pub mod codex_auto;

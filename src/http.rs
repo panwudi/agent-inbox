@@ -43,6 +43,7 @@ impl Response {
 }
 
 type Handler = dyn Fn(&str, Option<&str>) -> Response + Send + Sync;
+pub type Health = dyn Fn() -> bool + Send + Sync;
 pub type RouteHandler = dyn Fn(&str, &str, Option<&str>, Origin) -> Response + Send + Sync;
 pub type Authenticator = dyn Fn(&[u8]) -> Option<SenderIdentity> + Send + Sync;
 
@@ -68,6 +69,16 @@ pub fn serve(
     running: Arc<AtomicBool>,
     handler: Arc<Handler>,
 ) -> Result<()> {
+    serve_with_health(listener, token, running, handler, Arc::new(|| true))
+}
+
+pub fn serve_with_health(
+    listener: TcpListener,
+    token: Token,
+    running: Arc<AtomicBool>,
+    handler: Arc<Handler>,
+    health: Arc<Health>,
+) -> Result<()> {
     let authenticate =
         Arc::new(move |header: &[u8]| token.authorizes(header).then_some(SenderIdentity::Header));
     let route = Arc::new(
@@ -78,7 +89,7 @@ pub fn serve(
             handler(text, sender)
         },
     );
-    serve_authenticated(listener, running, authenticate, route)
+    serve_authenticated_with_health(listener, running, authenticate, route, health)
 }
 
 pub fn serve_authenticated(
@@ -86,6 +97,16 @@ pub fn serve_authenticated(
     running: Arc<AtomicBool>,
     authenticate: Arc<Authenticator>,
     handler: Arc<RouteHandler>,
+) -> Result<()> {
+    serve_authenticated_with_health(listener, running, authenticate, handler, Arc::new(|| true))
+}
+
+fn serve_authenticated_with_health(
+    listener: TcpListener,
+    running: Arc<AtomicBool>,
+    authenticate: Arc<Authenticator>,
+    handler: Arc<RouteHandler>,
+    health: Arc<Health>,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
     let workers = Arc::new(AtomicUsize::new(0));
@@ -106,11 +127,12 @@ pub fn serve_authenticated(
                 let workers = Arc::clone(&workers);
                 let authenticate = Arc::clone(&authenticate);
                 let handler = Arc::clone(&handler);
+                let health = Arc::clone(&health);
                 std::thread::spawn(move || {
                     let _guard = Worker(workers);
                     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                    let response = read_request(&mut stream, &authenticate, &handler)
+                    let response = read_request(&mut stream, &authenticate, &handler, &health)
                         .unwrap_or_else(|response| response);
                     let _ = respond(&mut stream, response);
                     // Half-close, then boundedly drain unread bytes so a rejection survives TCP close.
@@ -155,6 +177,7 @@ fn read_request(
     stream: &mut TcpStream,
     authenticate: &Arc<Authenticator>,
     handler: &Arc<RouteHandler>,
+    health: &Arc<Health>,
 ) -> std::result::Result<Response, Response> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut bytes = Vec::new();
@@ -187,6 +210,12 @@ fn read_request(
         Some("GET") => {
             if path != "/" {
                 return Err(Response::new(404, "unknown endpoint"));
+            }
+            if !health() {
+                return Ok(Response::new(
+                    503,
+                    "agent-inbox session is not receiving; inspect inbox_profile",
+                ));
             }
             return Ok(Response::new(
                 200,
