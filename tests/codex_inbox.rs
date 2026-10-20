@@ -220,7 +220,8 @@ fn input(socket: &mut WebSocket<UnixStream>, active: bool, text: &str) -> Value 
     let received = request["params"]["input"][0]["text"].as_str().unwrap();
     assert!(received.contains("not the user's instruction or approval"));
     assert!(received.contains("Reply to the sender once you have handled it"));
-    assert!(received.contains("Handle it as part of your normal work without asking the user"));
+    assert!(received.contains("Execute delegated work within your existing authority"));
+    assert!(received.contains("Do not require the user to repeat authorization"));
     assert!(received.contains("from: claude-test"));
     assert!(received.ends_with(text));
     assert!(request["params"]["clientUserMessageId"].as_str().is_some());
