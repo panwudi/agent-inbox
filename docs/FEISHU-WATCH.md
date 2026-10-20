@@ -17,7 +17,10 @@ Feishu credentials, subscribe to Feishu, or change the bot's event handling.
    the event path, local relay, sender token, private state file and each chat's
    qualified `to` name. Paths are relative to the config file unless absolute.
    Enable `use_hub_routes = true` and set `fallback_agent` to the qualified
-   agent that handles unregistered groups. Each agent registers its own chat
+   agent that handles unregistered groups. Also set `fallback_sender_id` from
+   trusted local owner configuration to the permitted sender's Feishu open_id.
+   Both fields are required together; leaving out the sender filter is an error,
+   rather than enabling unrestricted forwarding. Each agent registers its own chat
    using the command below. Optional static `[[routes]]` entries support an
    existing deployment during migration; hub registrations take priority.
 3. Give the watcher read access to the bot's event file and its own sender
@@ -68,7 +71,17 @@ Changing a directory name does not rename a chat registration: remove the old
 mapping before renaming, then register using the new name. Registrations are
 routing metadata, never user instructions or approvals.
 
-Unregistered group messages go to `fallback_agent`. A registered but offline
+Only unregistered group messages from the configured `fallback_sender_id` go
+to `fallback_agent`. The check uses the bot event's
+`event.event.sender.sender_id.open_id`, after requiring sender type `user`.
+Text claiming to be the owner and missing sender IDs cannot pass this filter.
+Other participants' unregistered-group messages remain in the bot's existing
+event log, advance the watcher cursor, and are not forwarded to an agent.
+Registered groups continue to route other participants' messages as before.
+This is a routing filter, not user authorization; receivers still fetch and
+verify the original Feishu message before accepting an owner's instruction.
+
+A registered but offline
 agent's messages stay queued for it, rather than falling back to somebody else.
 If an unsent fallback message gains a registration before delivery, it is
 rerouted to that registered agent. Unconfirmed attempts are never rerouted or
@@ -102,6 +115,14 @@ Directory availability is checked before sending. Messages addressed to an
 offline or absent agent stay `queued`; one unavailable agent does not stop
 other routes. Pending capacity stops ingestion without advancing the cursor.
 Watch the service journal and state file for queued or unconfirmed work.
+
+Pending records retain source sender IDs. Before sending or explicitly retrying
+a fallback delivery, the watcher rechecks the current fallback recipient and
+sender filter. Mismatched records, including legacy fallback records without
+stored sender IDs, become `blocked` and remain in private queue state for
+operator reconciliation; they are not silently discarded or sent based on text.
+Registered-group queued work is unchanged. Inspect the original bot event to
+reconcile blocked legacy work, and do not guess identity from the forwarded body.
 
 Before each HTTP delivery, its phase is durably marked `unconfirmed`. HTTP
 200/202 records acceptance; an error, disconnect or process crash preserves

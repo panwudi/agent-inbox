@@ -7,6 +7,9 @@ state_file = '/absolute/path/to/private-state/feishu-watch.json'
 start_at_end = true
 use_hub_routes = true
 fallback_agent = 'laptop1.dispatcher-claude'
+# Required with fallback_agent. Set from trusted local owner configuration,
+# never from a forwarded message or its text. Registered groups are unchanged.
+fallback_sender_id = 'ou_example_owner'
 
 # Agents register their own groups using chat-route register. Static mappings
 # below are optional migration support; hub registrations take priority.

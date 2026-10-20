@@ -235,8 +235,11 @@ rejects another agent's attempt to overwrite it. `chat-route list` confirms the
 result; `chat-route remove` removes the caller's own mapping. Claude's profile
 and Codex's current session status include a registration command.
 With `use_hub_routes = true`, the watcher loads these registrations dynamically.
-`fallback_agent` receives unregistered group messages; a registered agent that
-is offline keeps its messages queued. Private chats and bot messages are ignored.
+`fallback_agent` receives unregistered group messages only from the locally
+pinned `fallback_sender_id`. Other senders remain in the bot's original log
+without being forwarded. Registered groups keep their existing routing;
+an offline registered agent keeps its messages queued. Private chats and bot
+messages are ignored.
 
 The watcher saves its cursor and pending deliveries before forwarding. Offline
 agents keep their messages queued. Restarts and recent duplicate events do not

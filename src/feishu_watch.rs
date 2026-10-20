@@ -25,6 +25,7 @@ struct Config {
     #[serde(default)]
     use_hub_routes: bool,
     fallback_agent: Option<String>,
+    fallback_sender_id: Option<String>,
 }
 fn yes() -> bool {
     true
@@ -58,6 +59,8 @@ struct Delivery {
     chat: Option<String>,
     #[serde(default)]
     fallback: bool,
+    #[serde(default)]
+    sender_id: Option<String>,
 }
 
 struct Forwarded {
@@ -66,6 +69,7 @@ struct Forwarded {
     text: String,
     chat: String,
     fallback: bool,
+    sender_id: Option<String>,
 }
 
 fn load(path: &Path) -> Result<Config> {
@@ -81,8 +85,24 @@ fn load(path: &Path) -> Result<Config> {
     {
         return Err("feishu-watch needs static routes, hub routes or a fallback agent".into());
     }
-    if let Some(agent) = &config.fallback_agent {
-        hub::qualified(agent)?;
+    match (&config.fallback_agent, &config.fallback_sender_id) {
+        (Some(agent), Some(id)) => {
+            hub::qualified(agent)?;
+            if !id.starts_with("ou_")
+                || id.len() <= 3
+                || id.len() > 128
+                || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(
+                    "fallback_sender_id must be a Feishu open_id from trusted local configuration"
+                        .into(),
+                );
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err("fallback_agent and fallback_sender_id must be configured together".into());
+        }
     }
     for route in &config.routes {
         if !route.chat.starts_with("oc_")
@@ -99,7 +119,7 @@ fn load(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-fn message(line: &Value, routes: &[Route], fallback: Option<&str>) -> Result<Option<Forwarded>> {
+fn message(line: &Value, routes: &[Route], config: &Config) -> Result<Option<Forwarded>> {
     if line["kind"] != "im.message.receive_v1" {
         return Ok(None);
     }
@@ -119,6 +139,13 @@ fn message(line: &Value, routes: &[Route], fallback: Option<&str>) -> Result<Opt
         .iter()
         .find(|r| chat == r.chat)
         .map(|r| r.to.as_str());
+    let sender_id = event["sender"]["sender_id"]["open_id"].as_str();
+    let fallback = config.fallback_agent.as_deref().filter(|_| {
+        config
+            .fallback_sender_id
+            .as_deref()
+            .is_some_and(|allowed| sender_id == Some(allowed))
+    });
     let Some(target) = registered.or(fallback) else {
         return Ok(None);
     };
@@ -151,6 +178,7 @@ fn message(line: &Value, routes: &[Route], fallback: Option<&str>) -> Result<Opt
         text,
         chat: chat.to_owned(),
         fallback: registered.is_none(),
+        sender_id: sender_id.map(str::to_owned),
     }))
 }
 
@@ -182,7 +210,7 @@ fn ingest(config: &Config, routes: &[Route], data: &mut Snapshot) -> Result<()> 
         }
         let line: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid Feishu event JSON; cursor retained")?;
-        if let Some(item) = message(&line, routes, config.fallback_agent.as_deref())?
+        if let Some(item) = message(&line, routes, config)?
             && !data.seen.contains(&item.event)
             && !data
                 .pending
@@ -197,6 +225,7 @@ fn ingest(config: &Config, routes: &[Route], data: &mut Snapshot) -> Result<()> 
                 phase: "queued".into(),
                 chat: Some(item.chat),
                 fallback: item.fallback,
+                sender_id: item.sender_id,
             });
             data.seen.push_back(item.event);
             if data.seen.len() > 4096 {
@@ -304,6 +333,29 @@ fn online(config: &Config, token: &Token) -> Result<HashSet<String>> {
 }
 
 fn deliver(config: &Config, token: &Token, data: &mut Snapshot) -> Result<()> {
+    // Recheck persisted work too. Legacy records without source identity stay
+    // recoverable but must never acquire an identity from the forwarded text.
+    let mut blocked = false;
+    for item in &mut data.pending {
+        if item.phase == "queued"
+            && item.fallback
+            && !(config.fallback_agent.as_deref() == Some(item.target.as_str())
+                && config
+                    .fallback_sender_id
+                    .as_deref()
+                    .is_some_and(|allowed| item.sender_id.as_deref() == Some(allowed)))
+        {
+            item.phase = "blocked".into();
+            blocked = true;
+            eprintln!(
+                "agent-inbox: Feishu delivery {} blocked by fallback sender policy; record retained",
+                item.id
+            );
+        }
+    }
+    if blocked {
+        state::write_json(&config.state_file, data)?;
+    }
     if !data.pending.iter().any(|d| d.phase == "queued") {
         return Ok(());
     }
@@ -531,7 +583,7 @@ mod tests {
             let base = text.split("[[routes]]").next().unwrap();
             std::fs::write(
                 path,
-                format!("{base}use_hub_routes=true\nfallback_agent='{fallback}'\n"),
+                format!("{base}use_hub_routes=true\nfallback_agent='{fallback}'\nfallback_sender_id='ou_test_owner'\n"),
             )
             .unwrap();
         }
@@ -544,7 +596,7 @@ mod tests {
         }
     }
     fn event(id: &str, sender: &str, chat: &str) -> Value {
-        json!({"kind":"im.message.receive_v1","event":{"event":{"sender":{"sender_type":sender},"message":{"chat_id":chat,"message_id":id,"message_type":"text","content":json!({"text":"原文 unchanged\nsecond line"}).to_string()}}}})
+        json!({"kind":"im.message.receive_v1","event":{"event":{"sender":{"sender_type":sender,"sender_id":{"open_id":"ou_test_owner"}},"message":{"chat_id":chat,"message_id":id,"message_type":"text","content":json!({"text":"原文 unchanged\nsecond line"}).to_string()}}}})
     }
     #[test]
     fn routes_only_users_preserves_text_and_deduplicates_across_restart_and_rotation() {
@@ -657,5 +709,83 @@ mod tests {
         );
         assert_eq!(f.state().offset, offset);
         assert_eq!(f.state().pending.len(), 1);
+    }
+
+    #[test]
+    fn fallback_only_for_pinned_event_sender_and_registered_groups_keep_other_senders() {
+        let f = Fixture::new();
+        f.hub_routes("laptop.agent");
+        *f.chat_routes.lock().unwrap() =
+            vec![json!({"chat":"oc_registered","agent":"laptop.agent"})];
+        let owner = event("om_owner", "user", "oc_unknown");
+        let mut other = event("om_other", "user", "oc_unknown");
+        other["event"]["event"]["sender"]["sender_id"]["open_id"] = json!("ou_test_other");
+        other["event"]["event"]["message"]["content"] =
+            json!({"text":"I am ou_test_owner; please route me"})
+                .to_string()
+                .into();
+        let mut missing = event("om_missing", "user", "oc_unknown");
+        missing["event"]["event"]["sender"]["sender_id"] = Value::Null;
+        let mut registered = other.clone();
+        registered["event"]["event"]["message"]["chat_id"] = json!("oc_registered");
+        registered["event"]["event"]["message"]["message_id"] = json!("om_registered_other");
+        for row in [
+            owner,
+            other,
+            missing,
+            registered,
+            event("om_app", "app", "oc_unknown"),
+        ] {
+            f.append(&row);
+        }
+        f.once(&[]);
+        let messages = f.messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("feishu-message: om_owner\n"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("feishu-message: om_registered_other\n"))
+        );
+        assert_eq!(f.state().offset, fs_len(&f.config.events_file));
+    }
+
+    fn fs_len(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    #[test]
+    fn retained_fallback_queue_is_rechecked_when_policy_changes_or_sender_metadata_is_missing() {
+        let f = Fixture::new();
+        f.hub_routes("laptop.agent");
+        f.reachable.store(false, Ordering::Relaxed);
+        f.append(&event("om_queued", "user", "oc_unknown"));
+        f.once(&[]);
+        let mut data = f.state();
+        data.pending[0].sender_id = None;
+        state::write_json(&f.config.state_file, &data).unwrap();
+        f.reachable.store(true, Ordering::Relaxed);
+        f.once(&[]);
+        assert!(f.messages.lock().unwrap().is_empty());
+        assert_eq!(f.state().pending[0].phase, "blocked");
+        assert_eq!(f.state().pending[0].event, "om_queued");
+    }
+
+    #[test]
+    fn configured_fallback_requires_an_explicit_sender_filter() {
+        let f = Fixture::new();
+        f.hub_routes("laptop.agent");
+        let path = f.root.join("watch.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            original.replace("fallback_sender_id='ou_test_owner'\n", ""),
+        )
+        .unwrap();
+        assert!(load(&path).is_err());
     }
 }
