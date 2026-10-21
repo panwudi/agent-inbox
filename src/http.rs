@@ -408,6 +408,8 @@ pub fn response_reason(body: &str) -> &'static str {
         "unknown endpoint" => "unknown endpoint",
         "unknown relay endpoint" => "unknown relay endpoint",
         "unknown local agent; message saved" => "unknown local agent; message saved",
+        "unknown host; message saved" => "unknown host; message saved",
+        "unknown peer; message saved" => "unknown peer; message saved",
         "sender required" => "sender required",
         "invalid logical name" => "invalid logical name",
         "inbound hub requests must target this host" => {
@@ -426,6 +428,22 @@ pub fn response_reason(body: &str) -> &'static str {
         "request timed out" => "request timed out",
         "inbox busy; retry later" => "inbox busy; retry later",
         _ => "unrecognized response (body omitted)",
+    }
+}
+
+/// Preserve a routing failure across relays without exposing arbitrary bodies.
+pub fn missing_route(status: u16, body: &str) -> Option<&'static str> {
+    if status == 404
+        && matches!(
+            body.trim(),
+            "unknown local agent; message saved"
+                | "unknown host; message saved"
+                | "unknown peer; message saved"
+        )
+    {
+        Some(response_reason(body))
+    } else {
+        None
     }
 }
 
@@ -561,4 +579,29 @@ fn post_inner(
         status,
         String::from_utf8(response[header_end..header_end + length].to_vec())?,
     ))
+}
+
+#[cfg(test)]
+mod routing_diagnostics_tests {
+    use super::{missing_route, response_reason};
+
+    #[test]
+    fn only_static_missing_route_errors_are_forwarded_or_shown() {
+        for reason in [
+            "unknown peer; message saved",
+            "unknown host; message saved",
+            "unknown local agent; message saved",
+        ] {
+            assert_eq!(missing_route(404, reason), Some(reason));
+            assert_eq!(missing_route(401, reason), None);
+            assert_eq!(missing_route(502, reason), None);
+        }
+        let private = "unknown peer; message saved\nBearer private-credential";
+        assert_eq!(missing_route(404, private), None);
+        assert_eq!(
+            response_reason(private),
+            "unrecognized response (body omitted)"
+        );
+        assert_eq!(missing_route(404, "unknown endpoint"), None);
+    }
 }

@@ -294,6 +294,9 @@ impl Router {
         ) {
             Ok((200, _)) => http::Response::new(200, "peer accepted message"),
             Ok((202, _)) => http::Response::new(202, "peer queued message"),
+            Ok((status, reason)) if http::missing_route(status, &reason).is_some() => {
+                http::Response::new(404, http::response_reason(&reason))
+            }
             Ok((status, reason)) => {
                 eprintln!(
                     "agent-inbox: peer {name} rejected message: HTTP {status}: {}",

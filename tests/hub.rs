@@ -423,7 +423,7 @@ fn hub_confirms_delivery_when_the_peer_reply_takes_more_than_three_seconds() {
 
 #[test]
 fn peer_pending_and_rejection_are_reported_without_blind_retry() {
-    for (peer_status, expected) in [(202, 202), (401, 502), (503, 502)] {
+    for (peer_status, expected) in [(202, 202), (401, 502), (404, 502), (503, 502)] {
         let temp = Temp::new();
         let peer = FakePeer::start(&temp, peer_status);
         let hub = Hub::start(&temp, &temp.config(&peer.address));

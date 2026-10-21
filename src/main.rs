@@ -227,7 +227,7 @@ fn send(mut args: impl Iterator<Item = String>) -> Result<()> {
     };
     journal::append(&log, &sender, &destination, &text)?;
     let outcome = if hub_mode {
-        http::post(
+        http::post_diagnostic(
             &addr,
             &format!("/to/{destination}"),
             &token,
@@ -235,7 +235,16 @@ fn send(mut args: impl Iterator<Item = String>) -> Result<()> {
             &text,
             http::SEND_TIMEOUT,
         )
-        .and_then(http::accepted)
+        .and_then(|(status, body)| {
+            http::accepted(status).map_err(|error| {
+                let hint = if status == 404 {
+                    "; check --to against the exact name from who (host.agent for registered sessions)"
+                } else {
+                    ""
+                };
+                format!("{error}: {}{hint}", http::response_reason(&body)).into()
+            })
+        })
     } else {
         http::send(&addr, &token, &sender, &text)
     };

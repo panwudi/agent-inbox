@@ -76,6 +76,13 @@ defaults. Do not reuse another project's inbox port.
    receipt in the intended sessions. HTTP 202 can mean a durable Codex queue or
    an initializing Claude channel; it does not confirm the agent has acted.
 
+Use the exact name from `who`, including the host prefix for registered
+sessions. A bare project name is not an alias for its registered session;
+legacy static hub peer names still work as configured. Unknown peers, hosts
+and local agents return HTTP 404 through updated relays, with a safe routing
+reason and a CLI hint to check the directory. These failures are journaled,
+but are not automatically queued for a future matching registration.
+
 ## Directory and live agent configuration
 
 Every local agent has a one-line `description` of its ownership, up to 512

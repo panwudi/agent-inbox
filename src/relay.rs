@@ -234,7 +234,7 @@ impl Router {
             let (Some(inbox), Some(token)) = (&agent.inbox, &agent.token) else {
                 return http::Response::new(405, "sender-only agent has no inbox; message saved");
             };
-            http::post(
+            http::post_diagnostic(
                 inbox,
                 "/",
                 token,
@@ -243,7 +243,7 @@ impl Router {
                 Duration::from_secs(5),
             )
         } else {
-            http::post(
+            http::post_diagnostic(
                 &self.hub,
                 path,
                 &self.host_token,
@@ -253,8 +253,11 @@ impl Router {
             )
         };
         match outcome {
-            Ok(200) => http::Response::new(200, "destination accepted message"),
-            Ok(202) => http::Response::new(202, "destination queued message"),
+            Ok((200, _)) => http::Response::new(200, "destination accepted message"),
+            Ok((202, _)) => http::Response::new(202, "destination queued message"),
+            Ok((status, reason)) if http::missing_route(status, &reason).is_some() => {
+                http::Response::new(404, http::response_reason(&reason))
+            }
             Ok(_) => http::Response::new(502, "destination rejected message; relay saved it"),
             Err(_) => http::Response::new(
                 503,

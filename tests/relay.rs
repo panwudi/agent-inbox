@@ -200,6 +200,49 @@ fn hub(temp: &Temp, listen: &str, a: &str, b: &str) -> Process {
 }
 
 #[test]
+fn missing_routes_reach_the_sender_as_404_with_actionable_safe_diagnostics() {
+    let temp = Temp::new();
+    let a = Inbox::new(&temp, "alice.in");
+    let b = Inbox::new(&temp, "bob.in");
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let central = reserved.local_addr().unwrap().to_string();
+    let ar = Process::relay(
+        &temp,
+        &temp.relay_config("alpha", &central, &a.address),
+        "0",
+    );
+    let br = Process::relay(&temp, &temp.relay_config("beta", &central, &b.address), "0");
+    drop(reserved);
+    let _hub = hub(&temp, &central, &ar.address, &br.address);
+    for (target, reason) in [
+        ("bob", "unknown peer; message saved"),
+        ("missing.bob", "unknown host; message saved"),
+        ("alpha.missing", "unknown local agent; message saved"),
+        ("beta.missing", "unknown local agent; message saved"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-inbox"))
+            .args(["send", "--hub", &ar.address, "--to", target, "--token-file"])
+            .arg(temp.0.join("alice.send"))
+            .arg("--log")
+            .arg(temp.0.join("sender.md"))
+            .arg("missing route test")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("HTTP 404"), "{error}");
+        assert!(error.contains(reason), "{error}");
+        assert!(error.contains("exact name from who (host.agent"), "{error}");
+        assert!(!error.contains("HTTP 502"), "{error}");
+        for secret in [AHOST, BHOST, ASEND, BSEND, AIN, BIN] {
+            assert!(!error.contains(secret));
+        }
+    }
+    assert!(a.received.try_recv().is_err());
+    assert!(b.received.try_recv().is_err());
+}
+
+#[test]
 fn cross_host_delivery_uses_host_tokens_and_preserves_qualified_sender() {
     let temp = Temp::new();
     let a = Inbox::new(&temp, "alice.in");
